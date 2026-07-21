@@ -5,7 +5,8 @@ import requests
 import asyncio
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
-from aiohttp import web  # aiohttp тянется через aiogram
+from aiogram.client.default import DefaultBotProperties
+from aiohttp import web
 
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -27,7 +28,8 @@ if not BOT_TOKEN or not SSTATS_KEY:
     logging.critical("Критические переменные BOT_TOKEN или SSTATS_KEY не найдены в панели!")
     sys.exit(1)
 
-bot = Bot(token=BOT_TOKEN)
+# Исправлено: добавлен DefaultBotProperties
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
 dp = Dispatcher()
 
 main_kb = ReplyKeyboardMarkup(
@@ -37,7 +39,7 @@ main_kb = ReplyKeyboardMarkup(
 
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
-    logging.info(f"User {message.from_user.id} started bot")
+    logging.info(f"=== ПОЛУЧЕНО /start от {message.from_user.id} ===")
     await message.answer(
         "👋 Привет! Я бот-аналитик футбольного **ИТБ** на базе SStats.\n"
         "Отправь мне названия двух команд через дефис.\n"
@@ -143,7 +145,7 @@ async def start_web():
 async def main():
     logging.info("--- ЗАПУСК БОТА ---")
     await asyncio.gather(
-        dp.start_polling(bot),
+        dp.start_polling(bot, skip_updates=True),  # Исправлено: skip_updates=True
         start_web()
     )
 
