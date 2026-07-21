@@ -1,3 +1,4 @@
+
 import os
 import sys
 import logging
@@ -5,6 +6,7 @@ import requests
 import asyncio
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiohttp import web
 
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -14,7 +16,7 @@ logging.basicConfig(
     stream=sys.stdout
 )
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("BOTTOKEN")
 SSTATS_KEY = os.getenv("SSTATS_KEY") or os.getenv("SSTATSKEY")
 
 logging.info(f"BOT_TOKEN найден: {'ДА' if BOT_TOKEN else 'НЕТ'}")
@@ -127,9 +129,24 @@ async def analyze_match(message: Message):
     )
     await message.answer(report, parse_mode="Markdown")
 
+async def health(request):
+    return web.Response(text="OK")
+
+async def start_web():
+    app = web.Application()
+    app.router.add_get("/", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", 8080)
+    await site.start()
+    logging.info("Web server started on port 8080")
+
 async def main():
     logging.info("--- ЗАПУСК БОТА ---")
-    await dp.start_polling(bot)
+    await asyncio.gather(
+        dp.start_polling(bot),
+        start_web()
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
