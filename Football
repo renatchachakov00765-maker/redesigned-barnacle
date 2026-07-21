@@ -1,1 +1,125 @@
+aiogram==3.13.1
+requests==2.32.3
+worker: python main.py
+import os
+import requests
+from aiogram import Bot, Dispatcher, html, F
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+
+# --- НАСТРОЙКИ ---
+BOT_TOKEN = "ВАШ_ТЕЛЕГРАМ_ТОКЕН"
+RAPIDAPI_KEY = "ВАШ_RAPIDAPI_КЛЮЧ"
+RAPIDAPI_HOST = "://rapidapi.com"
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+# Главная клавиатура
+main_kb = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="⚽ Анализ ИТБ")]],
+    resize_keyboard=True
+)
+
+@dp.message(F.text == "/start")
+async def cmd_start(message: Message):
+    await message.answer(
+        "👋 Привет! Я бот-аналитик футбольного **ИТБ**.\n"
+        "Отправь мне названия двух команд через дефис, чтобы узнать прогноз.\n"
+        "Пример: `Реал Мадрид - Барселона`", 
+        reply_markup=main_kb,
+        parse_mode="Markdown"
+    )
+
+@dp.message(F.text == "⚽ Анализ ИТБ")
+async def ask_teams(message: Message):
+    await message.answer("Введите две команды в формате: `Команда1 - Команда2`")
+
+def get_team_id(team_name: str):
+    """Поиск ID команды по названию через API"""
+    url = f"https://{RAPIDAPI_HOST}/v3/teams"
+    querystring = {"search": team_name}
+    headers = {"X-RapidAPI-Key": RAPIDAPI_KEY, "X-RapidAPI-Host": RAPIDAPI_HOST}
+    
+    try:
+        response = requests.get(url, headers=headers, params=querystring, timeout=10).json()
+        if response.get("response"):
+            return response["response"][0]["team"]["id"], response["response"][0]["team"]["name"]
+    except Exception:
+        pass
+    return None, None
+
+def get_average_goals(team_id: int, is_home: bool):
+    """Получение среднего тотала за последние 5 матчей"""
+    url = f"https://{RAPIDAPI_HOST}/v3/fixtures"
+    querystring = {"team": team_id, "last": "5"}
+    headers = {"X-RapidAPI-Key": RAPIDAPI_KEY, "X-RapidAPI-Host": RAPIDAPI_HOST}
+    
+    try:
+        response = requests.get(url, headers=headers, params=querystring, timeout=10).json()
+        fixtures = response.get("response", [])
+        if not fixtures:
+            return 0.0
+            
+        total_goals = 0
+        games_counted = 0
+        
+        for f in fixtures:
+            goals = f.get("goals", {})
+            # Считаем голы команды в зависимости от того, играет она дома или в гостях
+            if f["teams"]["home"]["id"] == team_id:
+                total_goals += goals.get("home", 0) or 0
+            else:
+                total_goals += goals.get("away", 0) or 0
+            games_counted += 1
+            
+        return round(total_goals / games_counted, 2) if games_counted > 0 else 0.0
+    except Exception:
+        return 0.0
+
+@dp.message()
+async def analyze_match(message: Message):
+    if "-" not in message.text:
+        return
+
+    teams = message.text.split("-")
+    if len(teams) != 2:
+        await message.answer("❌ Неверный формат. Используйте: Команда1 - Команда2")
+        return
+
+    t1_name, t2_name = teams[0].strip(), teams[1].strip()
+    await message.answer(f"⏳ Ищу статистику для {t1_name} и {t2_name}...")
+
+    t1_id, t1_correct_name = get_team_id(t1_name)
+    t2_id, t2_correct_name = get_team_id(t2_name)
+
+    if not t1_id or not t2_id:
+        await message.answer("❌ Одна из команд не найдена. Пишите названия на английском (например, Real Madrid).")
+        return
+
+    # Считаем средние голы (первая команда — дома, вторая — на выезде)
+    t1_avg = get_average_goals(t1_id, is_home=True)
+    t2_avg = get_average_goals(t2_id, is_home=False)
+
+    # Простейший алгоритм рекомендации ИТБ
+    itb1_suggestion = f"ИТБ1 (1.0)" if t1_avg >= 1.2 else f"ИТБ1 (0.5)"
+    if t1_avg >= 1.8: itb1_suggestion = f"ИТБ1 (1.5)"
+
+    itb2_suggestion = f"ИТБ2 (1.0)" if t2_avg >= 1.2 else f"ИТБ2 (0.5)"
+    if t2_avg >= 1.8: itb2_suggestion = f"ИТБ2 (1.5)"
+
+    report = (
+        f"📊 **Анализ индивидуального тотала:**\n\n"
+        f"🏠 **{t1_correct_name}** (Дома):\n"
+        f"• Средний тотал за 5 игр: {t1_avg} гола(ов)\n"
+        f"• Рекомендуемая ставка: **{itb1_suggestion}**\n\n"
+        f"🚀 **{t2_correct_name}** (В гостях):\n"
+        f"• Средний тотал за 5 игр: {t2_avg} гола(ов)\n"
+        f"• Рекомендуемая ставка: **{itb2_suggestion}**"
+    )
+    
+    await message.answer(report, parse_mode="Markdown")
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(dp.start_polling(bot))
 
