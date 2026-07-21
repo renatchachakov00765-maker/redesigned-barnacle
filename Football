@@ -1,6 +1,4 @@
 
-
-
 import os
 import sys
 import logging
@@ -17,8 +15,16 @@ logging.basicConfig(
     stream=sys.stdout
 )
 
+# Отладка: показываем все имена env переменных (значения скрыты)
+env_names = sorted(os.environ.keys())
+logging.info(f"Все env переменные: {env_names}")
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SSTATS_KEY = os.getenv("SSTATS_KEY")
+
+logging.info(f"BOT_TOKEN найден: {'ДА' if BOT_TOKEN else 'НЕТ'}")
+logging.info(f"SSTATS_KEY найден: {'ДА' if SSTATS_KEY else 'НЕТ'}")
+
 API_BASE_URL = "https://sstats.net"
 
 if not BOT_TOKEN or not SSTATS_KEY:
