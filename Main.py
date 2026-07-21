@@ -1,5 +1,4 @@
-aiogram>=3.0.0
-requests
+
 
 
 import os
