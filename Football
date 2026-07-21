@@ -298,7 +298,10 @@ async def cmd_help(message: Message):
         parse_mode="HTML"
     )
 
-
+aiogram>=3.0
+aiohttp>=3.8
+python-dotenv>=1.0
+apscheduler>=3.10
 # ============ ЗАПУСК ============
 async def main():
     scheduler = AsyncIOScheduler(timezone=SCAN_TZ)
