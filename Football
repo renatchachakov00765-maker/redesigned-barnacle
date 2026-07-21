@@ -1,13 +1,19 @@
+
 import os
+import sys
 import logging
 import requests
+import asyncio
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 
-# 1. Логирование для Bothost
+# Принудительно заставляем Python сразу выводить логи на хостинг
+sys.stdout.reconfigure(line_buffering=True)
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    stream=sys.stdout
 )
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -15,8 +21,8 @@ SSTATS_KEY = os.getenv("SSTATS_KEY")
 API_BASE_URL = "https://sstats.net"
 
 if not BOT_TOKEN or not SSTATS_KEY:
-    logging.critical("ОШИБКА: Проверьте переменные BOT_TOKEN и SSTATS_KEY на Bothost!")
-    raise ValueError("Критические переменные окружения не настроены!")
+    logging.critical("Критические переменные BOT_TOKEN или SSTATS_KEY не найдены в панели!")
+    sys.exit(1)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -28,10 +34,11 @@ main_kb = ReplyKeyboardMarkup(
 
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
+    logging.info(f"User {message.from_user.id} started bot")
     await message.answer(
         "👋 Привет! Я бот-аналитик футбольного **ИТБ** на базе SStats.\n"
         "Отправь мне названия двух команд через дефис.\n"
-        "Пример: `Реал Мадрид - Барселона` (можно писать на русском)", 
+        "Пример: `Реал Мадрид - Барселона`", 
         reply_markup=main_kb,
         parse_mode="Markdown"
     )
@@ -41,44 +48,35 @@ async def ask_teams(message: Message):
     await message.answer("Введите две команды в формате: `Команда1 - Команда2`")
 
 def get_team_id(team_name: str):
-    """Поиск ID команды по названию в базе SStats"""
     url = f"{API_BASE_URL}/teams/search"
     params = {"query": team_name.strip(), "api_key": SSTATS_KEY}
-    
     try:
         logging.info(f"SStats: Поиск команды {team_name}")
         response = requests.get(url, params=params, timeout=10).json()
         if response and isinstance(response, list) and len(response) > 0:
-            # Берем первый подходящий результат
             return response[0]["id"], response[0]["name"]
     except Exception as e:
         logging.error(f"Ошибка поиска в SStats для {team_name}: {e}")
     return None, None
 
 def get_average_goals(team_id: int):
-    """Расчет среднего тотала за последние 5 матчей из SStats"""
     url = f"{API_BASE_URL}/teams/{team_id}/matches"
     params = {"limit": 5, "api_key": SSTATS_KEY}
-    
     try:
         logging.info(f"SStats: Запрос последних матчей для ID {team_id}")
         response = requests.get(url, params=params, timeout=10).json()
         matches = response.get("matches", []) if isinstance(response, dict) else response
-        
         if not matches or not isinstance(matches, list):
             return 0.0
             
         total_goals = 0
         games_counted = 0
-        
         for m in matches[:5]:
-            # В SStats голы обычно лежат в home_score и away_score
             if m.get("home_team_id") == team_id:
                 total_goals += m.get("home_score", 0) or 0
             else:
                 total_goals += m.get("away_score", 0) or 0
             games_counted += 1
-            
         return round(total_goals / games_counted, 2) if games_counted > 0 else 0.0
     except Exception as e:
         logging.error(f"Ошибка подсчета голов в SStats для ID {team_id}: {e}")
@@ -94,9 +92,11 @@ async def analyze_match(message: Message):
         await message.answer("❌ Используйте формат: Команда1 - Команда2")
         return
 
-    t1_name, t2_name = teams[0], teams[1]
+    t1_name = teams[0].strip()
+    t2_name = teams[1].strip()
+    
     logging.info(f"Запрос анализа матча: {t1_name} - {t2_name}")
-    await message.answer(f"⏳ Запрашиваю базу SStats для {t1_name.strip()} и {t2_name.strip()}...")
+    await message.answer(f"⏳ Запрашиваю базу SStats для {t1_name} и {t2_name}...")
 
     t1_id, t1_correct_name = get_team_id(t1_name)
     t2_id, t2_correct_name = get_team_id(t2_name)
@@ -123,13 +123,14 @@ async def analyze_match(message: Message):
         f"• Средний тотал за 5 игр: {t2_avg} гола(ов)\n"
         f"• Прогноз: **{itb2_suggestion}**"
     )
-    
     await message.answer(report, parse_mode="Markdown")
 
+async def main():
+    logging.info("--- ЗАПУСК БОТА ---")
+    await dp.start_polling(bot)
+
 if __name__ == "__main__":
-    logging.info("Бот на SStats успешно запущен!")
-    import asyncio
-    asyncio.run(dp.start_polling(bot))
+    asyncio.run(main())
 
 
 
