@@ -1,0 +1,311 @@
+import asyncio
+import logging
+import os
+import math
+from datetime import datetime
+
+from aiogram import Bot, Dispatcher
+from aiogram.filters import Command
+from aiogram.types import Message
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from dotenv import load_dotenv
+import aiohttp
+
+load_dotenv()
+
+# ============ ENV VARS ============
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+SSTATS_API_KEY = os.getenv("SSTATS_API_KEY", "")
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "")
+API_HOST = "https://api.sstats.net"
+
+# ============ НАСТРОЙКИ ============
+BAD_LEAGUES = ["women", "female", "friendlies", "friendly", "u17", "u18", "u19", "u20", "u21", "youth",
+               "2nd division", "3rd division", "4th division", "serie c", "serie d", "liga 2", "liga 3",
+               "national league", "isthmian", "northern premier", "southern league", "western league"]
+
+BASELINE = {
+    "Premier League": 4.8, "La Liga": 4.5, "Serie A": 4.3,
+    "Bundesliga": 5.2, "Ligue 1": 4.6, "Russian Premier League": 4.0,
+    "default": 4.5
+}
+
+MIN_Glicko = 1500
+MIN_ODDS = 1.20
+ITB_LINE = 0.5
+SCAN_HOUR = 10
+SCAN_TZ = "Europe/Samara"
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+
+# ============ SSTATS CLIENT ============
+class SStatsClient:
+    def __init__(self):
+        self.session = None
+    
+    async def _get(self, endpoint: str, params: dict = None):
+        if self.session is None:
+            self.session = aiohttp.ClientSession()
+        url = f"{API_HOST}{endpoint}"
+        params = params or {}
+        if SSTATS_API_KEY:
+            params["apikey"] = SSTATS_API_KEY
+        async with self.session.get(url, params=params, timeout=30) as resp:
+            resp.raise_for_status()
+            return await resp.json()
+    
+    async def get_today_matches(self):
+        return await self._get("/Games/list", {"Today": True, "TimeZone": 4, "limit": 1000})
+    
+    async def get_match(self, game_id: int):
+        return await self._get(f"/Games/{game_id}")
+    
+    async def get_odds(self, game_id: int):
+        return await self._get(f"/Odds/{game_id}")
+    
+    async def get_glicko(self, game_id: int):
+        return await self._get(f"/Games/glicko/{game_id}")
+    
+    async def get_team_matches(self, team_id: int, year: int, limit: int = 10):
+        return await self._get("/Games/list", {"team": team_id, "year": year, "ended": True, "limit": limit})
+    
+    async def close(self):
+        if self.session:
+            await self.session.close()
+
+
+client = SStatsClient()
+
+
+# ============ ФИЛЬТРЫ ============
+def good_league(name: str) -> bool:
+    name_lower = name.lower()
+    for bad in BAD_LEAGUES:
+        if bad in name_lower:
+            return False
+    return True
+
+def good_glicko(data: dict) -> bool:
+    if not data or "data" not in data:
+        return True
+    teams = data.get("data", {})
+    home = teams.get("home", {}).get("rating", 0)
+    away = teams.get("away", {}).get("rating", 0)
+    return home >= MIN_Glicko and away >= MIN_Glicko
+
+
+# ============ КАЛЬКУЛЯТОР ============
+def get_baseline(league_name: str) -> float:
+    return BASELINE.get(league_name, BASELINE["default"])
+
+def team_stats(matches: list, is_home: bool) -> tuple:
+    goals, conceded = [], []
+    for m in matches:
+        if is_home:
+            g, c = m.get("goalsHome", 0), m.get("goalsAway", 0)
+        else:
+            g, c = m.get("goalsAway", 0), m.get("goalsHome", 0)
+        if m.get("status") == "FT" or g is not None:
+            goals.append(g or 0)
+            conceded.append(c or 0)
+    if not goals:
+        return 0.0, 0.0
+    return round(sum(goals)/len(goals), 2), round(sum(conceded)/len(conceded), 2)
+
+def calc_lambda(goals_avg: float, opponent_conceded: float, baseline: float) -> float:
+    raw = (goals_avg + opponent_conceded) / 2
+    return round(raw * (baseline / 4.5), 2)
+
+def calc_pi(lam: float) -> float:
+    if lam <= 0:
+        return 0.0
+    return round(lam * 4.5, 2)
+
+def poisson_prob(lam: float, line: float) -> float:
+    def p(k):
+        return (lam ** k) * math.exp(-lam) / math.factorial(k)
+    p_cum = sum(p(k) for k in range(int(line) + 1))
+    return 1 - p_cum
+
+def extract_itb_odds(odds_data: dict, team: str, line: float) -> float:
+    if not odds_data or "data" not in odds_data:
+        return 0.0
+    market_name = "Total - Home" if team == "home" else "Total - Away"
+    over_name = f"Over {line}"
+    for bookmaker in odds_data.get("data", []):
+        for market in bookmaker.get("odds", []):
+            if market.get("marketName") == market_name:
+                for outcome in market.get("odds", []):
+                    if outcome.get("name") == over_name:
+                        val = outcome.get("value")
+                        return float(val) if val is not None else 0.0
+    return 0.0
+
+def get_verdict(prob: float, pi: float, odds: float) -> str:
+    if pi < 1.0:
+        return "NO"
+    if odds > 0 and odds < MIN_ODDS:
+        return "NO (коэф низкий)"
+    if prob < 0.65:
+        return "NO"
+    if prob < 0.75:
+        return "ГРАНИЦА"
+    return "GO"
+
+
+# ============ СКАНЕР ============
+async def scan_matches():
+    logger.info("Сканирую матчи...")
+    try:
+        response = await client.get_today_matches()
+        matches = response.get("data", [])
+        if not matches:
+            await send_admin("📭 Матчей на сегодня не найдено")
+            return
+        
+        results = []
+        year = datetime.now().year
+        
+        for match in matches:
+            league = match.get("league", {}).get("name", "")
+            if not good_league(league):
+                continue
+            
+            game_id = match.get("id")
+            if not game_id:
+                continue
+            
+            match_data, odds_data, glicko_data = await asyncio.gather(
+                client.get_match(game_id),
+                client.get_odds(game_id),
+                client.get_glicko(game_id)
+            )
+            
+            if not good_glicko(glicko_data):
+                continue
+            
+            home_id = match.get("homeTeam", {}).get("id")
+            away_id = match.get("awayTeam", {}).get("id")
+            
+            home_hist, away_hist = await asyncio.gather(
+                client.get_team_matches(home_id, year, 10) if home_id else asyncio.sleep(0),
+                client.get_team_matches(away_id, year, 10) if away_id else asyncio.sleep(0)
+            )
+            
+            home_history = home_hist.get("data", []) if isinstance(home_hist, dict) else []
+            away_history = away_hist.get("data", []) if isinstance(away_hist, dict) else []
+            
+            baseline = get_baseline(league)
+            home_goals, home_conceded = team_stats(home_history, True)
+            away_goals, away_conceded = team_stats(away_history, False)
+            
+            lambda_home = calc_lambda(home_goals, away_conceded, baseline)
+            lambda_away = calc_lambda(away_goals, home_conceded, baseline)
+            
+            pi_home = calc_pi(lambda_home)
+            pi_away = calc_pi(lambda_away)
+            
+            odds_home = extract_itb_odds(odds_data, "home", ITB_LINE)
+            odds_away = extract_itb_odds(odds_data, "away", ITB_LINE)
+            
+            for team, team_name, lam, pi, odds in [
+                ("home", match.get("homeTeam", {}).get("name", "?"), lambda_home, pi_home, odds_home),
+                ("away", match.get("awayTeam", {}).get("name", "?"), lambda_away, pi_away, odds_away)
+            ]:
+                prob = poisson_prob(lam, ITB_LINE)
+                verdict = get_verdict(prob, pi, odds)
+                
+                if verdict in ("GO", "ГРАНИЦА"):
+                    results.append({
+                        "match": f"{match.get('homeTeam', {}).get('name', '?')} vs {match.get('awayTeam', {}).get('name', '?')}",
+                        "team": team_name,
+                        "home_away": "дома" if team == "home" else "в гостях",
+                        "pi": pi,
+                        "lambda": lam,
+                        "goals_avg": home_goals if team == "home" else away_goals,
+                        "conceded_avg": home_conceded if team == "home" else away_conceded,
+                        "prob": prob,
+                        "odds": odds if odds else "нет",
+                        "verdict": verdict
+                    })
+        
+        if results:
+            text = f"🎯 <b>Найдено: {len(results)}</b>\n\n"
+            for r in results:
+                text += (
+                    f"⚽ <b>{r['match']}</b>\n"
+                    f"Команда: <b>{r['team']}</b> ({r['home_away']})\n"
+                    f"📊 PI: <code>{r['pi']}</code> | λ: <code>{r['lambda']}</code>\n"
+                    f"⚽ Забито: <code>{r['goals_avg']}</code> | Пропущено: <code>{r['conceded_avg']}</code>\n"
+                    f"🎯 Вероятность ИТБ{ITB_LINE}: <code>{r['prob']*100:.1f}%</code>\n"
+                    f"💰 Коэф: <code>{r['odds']}</code>\n"
+                    f"✅ <b>{r['verdict']}</b>\n"
+                    f"{'─' * 25}\n"
+                )
+        else:
+            text = "📭 Матчей не найдено."
+        
+        await send_admin(text)
+        logger.info(f"Скан завершён. Найдено: {len(results)}")
+        
+    except Exception as e:
+        logger.error(f"Ошибка: {e}")
+        await send_admin(f"❌ Ошибка скана: {e}")
+
+async def send_admin(text: str):
+    if ADMIN_CHAT_ID:
+        for i in range(0, len(text), 4000):
+            await bot.send_message(chat_id=int(ADMIN_CHAT_ID), text=text[i:i+4000], parse_mode="HTML")
+
+
+# ============ КОМАНДЫ ============
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    await message.answer(
+        "⚽ <b>Бот ИТБ</b>\n\n"
+        "Команды:\n"
+        "/scan — сканировать сегодня\n"
+        "/status — статус\n"
+        "/help — справка",
+        parse_mode="HTML"
+    )
+
+@dp.message(Command("scan"))
+async def cmd_scan(message: Message):
+    await message.answer("🔍 Сканирую...")
+    await scan_matches()
+
+@dp.message(Command("status"))
+async def cmd_status(message: Message):
+    await message.answer(f"🟢 Работаю. Автоскан: {SCAN_HOUR}:00 Ижевск.")
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    await message.answer(
+        "<b>Как работает:</b>\n"
+        "1. Беру матчи на сегодня из SStats\n"
+        "2. Фильтрую лиги (без женских, товарищеских)\n"
+        "3. Проверяю Glicko > 1500\n"
+        "4. Считаю λ и PI\n"
+        "5. Вероятность ИТБ > 65% = сигнал\n"
+        "6. Коэф от 1.20 для справки",
+        parse_mode="HTML"
+    )
+
+
+# ============ ЗАПУСК ============
+async def main():
+    scheduler = AsyncIOScheduler(timezone=SCAN_TZ)
+    scheduler.add_job(scan_matches, CronTrigger(hour=SCAN_HOUR, minute=0), id="daily_scan")
+    scheduler.start()
+    logger.info("Бот запущен")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
