@@ -1,3 +1,4 @@
+
 import os
 import sys
 import logging
@@ -70,6 +71,8 @@ dp = Dispatcher()
 _team_cache = {}
 _matches_cache = {}
 _cache_time = {}
+_leagues_cache = None
+_leagues_cache_time = None
 
 # === KEYBOARD ===
 main_kb = ReplyKeyboardMarkup(
@@ -103,12 +106,27 @@ def api_get(endpoint: str, params: dict = None, retries: int = 3):
             else:
                 return None
 
+def get_leagues():
+    """Получить список лиг с кэшированием."""
+    global _leagues_cache, _leagues_cache_time
+    now = datetime.now()
+    if _leagues_cache and _leagues_cache_time and (now - _leagues_cache_time).seconds < 3600:
+        return _leagues_cache
+
+    data = api_get("/leagues")
+    if data and data.get("status") == "ok" and data.get("data"):
+        _leagues_cache = data["data"]
+        _leagues_cache_time = now
+        logging.info(f"Loaded {len(_leagues_cache)} leagues")
+        return _leagues_cache
+    return []
+
 def get_team_id(team_name: str):
     key = team_name.lower().strip()
     if key in _team_cache:
         return _team_cache[key]
 
-    data = api_get("/Teams/list", {"Name": team_name, "Limit": 10})
+    data = api_get("/teams/list", {"Name": team_name, "Limit": 10})
     if data and data.get("status") == "ok" and data.get("data"):
         teams = data["data"]
         for t in teams:
@@ -136,7 +154,7 @@ def get_team_matches(team_id: int, limit: int = 10, is_home: bool = None):
         "Order": -1,
     }
 
-    data = api_get("/Games/list", params)
+    data = api_get("/games/list", params)
     if not data or data.get("status") != "ok" or not data.get("data"):
         return []
 
@@ -167,30 +185,57 @@ def get_team_matches(team_id: int, limit: int = 10, is_home: bool = None):
     return result
 
 def get_today_fixtures(max_matches: int = 10):
+    """Получить матчи на сегодня через /games/list?LeagueId=&Year="""
     today = datetime.now().strftime("%Y-%m-%d")
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-    tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
 
-    # Try multiple date approaches
-    approaches = [
-        ("Date=today", {"Date": today, "Upcoming": "true", "Limit": max_matches}),
-        ("From=yesterday To=tomorrow", {"From": yesterday, "To": tomorrow, "Upcoming": "true", "Limit": max_matches}),
-        ("No date just Upcoming", {"Upcoming": "true", "Limit": max_matches}),
-        ("Today=true", {"Today": "true", "Limit": max_matches}),
-    ]
+    # Получаем список лиг
+    leagues = get_leagues()
+    if not leagues:
+        logging.warning("No leagues loaded")
+        return []
 
-    for name, params in approaches:
-        logging.info(f"Trying fixtures approach: {name}")
-        data = api_get("/Games/list", params)
-        if data and data.get("status") == "ok" and data.get("data"):
-            matches = data["data"]
-            logging.info(f"Approach {name} returned {len(matches)} matches")
-            if len(matches) > 0:
-                return matches
-        else:
-            logging.info(f"Approach {name} returned empty or error")
+    all_matches = []
+    current_year = datetime.now().year  # 2026
 
-    return []
+    # Запрашиваем матчи для каждой лиги
+    # Ограничиваем количество лиг для скорости
+    target_leagues = leagues[:25]  # Первые 25 лиг
+
+    for league in target_leagues:
+        league_id = league.get("id")
+        league_name = league.get("name", "?")
+        if not league_id:
+            continue
+
+        params = {
+            "LeagueId": league_id,
+            "Year": current_year,
+            "Limit": 30
+        }
+
+        data = api_get("/games/list", params)
+
+        if data and data.get("status") == "ok":
+            matches = data.get("data", [])
+            if matches:
+                logging.info(f"League {league_id} ({league_name}): {len(matches)} matches loaded")
+                all_matches.extend(matches)
+
+    # Фильтруем по сегодняшней дате
+    today_matches = []
+    for m in all_matches:
+        match_date = m.get("date") or m.get("matchDate") or m.get("Date") or m.get("startDate")
+        if match_date:
+            match_date_str = str(match_date)[:10]
+            if today == match_date_str:
+                today_matches.append(m)
+
+    logging.info(f"Total matches for {today}: {len(today_matches)}")
+
+    # Сортируем по времени
+    today_matches.sort(key=lambda x: x.get("date", "") or x.get("matchDate", ""))
+
+    return today_matches[:max_matches]
 
 # === PROBABILITY CALC ===
 def poisson_probability(lambda_val: float, target: int = 1):
