@@ -1,3 +1,4 @@
+
 import os
 import sys
 import logging
@@ -16,14 +17,18 @@ logging.basicConfig(
     stream=sys.stdout
 )
 
-BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("BOTTOKEN")
-SSTATS_KEY = os.getenv("SSTATS_KEY") or os.getenv("SSTATSKEY")
+# === ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ===
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+SSTATS_KEY = os.getenv("SSTATS_KEY")
+
+if not BOT_TOKEN:
+    logging.critical("BOT_TOKEN не найден!")
+    sys.exit(1)
+if not SSTATS_KEY:
+    logging.critical("SSTATS_KEY не найден!")
+    sys.exit(1)
 
 API_BASE_URL = "https://sstats.net"
-
-if not BOT_TOKEN or not SSTATS_KEY:
-    logging.critical("Переменные не найдены!")
-    sys.exit(1)
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
 dp = Dispatcher()
@@ -32,6 +37,8 @@ main_kb = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="⚽ Анализ ИТБ")]],
     resize_keyboard=True
 )
+
+# ==================== HANDLERS ====================
 
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
@@ -48,25 +55,32 @@ def get_team_id(team_name: str):
     url = f"{API_BASE_URL}/teams/search"
     params = {"query": team_name.strip(), "api_key": SSTATS_KEY}
     try:
-        response = requests.get(url, params=params, timeout=10).json()
-        if response and isinstance(response, list) and len(response) > 0:
-            return response[0]["id"], response[0]["name"]
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        if data and isinstance(data, list) and len(data) > 0:
+            return data[0]["id"], data[0]["name"]
     except Exception as e:
-        logging.error(f"Ошибка: {e}")
+        logging.error(f"Ошибка поиска команды '{team_name}': {e}")
     return None, None
 
 def get_average_goals(team_id: int):
     url = f"{API_BASE_URL}/teams/{team_id}/matches"
     params = {"limit": 5, "api_key": SSTATS_KEY}
     try:
-        response = requests.get(url, params=params, timeout=10).json()
-        matches = response.get("matches", []) if isinstance(response, dict) else []
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        matches = data.get("matches", []) if isinstance(data, dict) else []
         if not matches:
             return 0.0
-        total = sum(m.get("home_score", 0) if m.get("home_team_id") == team_id else m.get("away_score", 0) for m in matches[:5])
+        total = sum(
+            m.get("home_score", 0) if m.get("home_team_id") == team_id else m.get("away_score", 0)
+            for m in matches[:5]
+        )
         return round(total / len(matches[:5]), 2)
     except Exception as e:
-        logging.error(f"Ошибка: {e}")
+        logging.error(f"Ошибка получения матчей team_id={team_id}: {e}")
         return 0.0
 
 @dp.message()
@@ -81,11 +95,11 @@ async def analyze_match(message: Message):
     t1_name, t2_name = teams[0].strip(), teams[1].strip()
     await message.answer(f"⏳ Ищу {t1_name} и {t2_name}...")
 
-    t1_id, t1_name = get_team_id(t1_name)
-    t2_id, t2_name = get_team_id(t2_name)
+    t1_id, t1_found = get_team_id(t1_name)
+    t2_id, t2_found = get_team_id(t2_name)
 
     if not t1_id or not t2_id:
-        await message.answer("❌ Команда не найдена")
+        await message.answer("❌ Одна или обе команды не найдены")
         return
 
     t1_avg = get_average_goals(t1_id)
@@ -94,49 +108,34 @@ async def analyze_match(message: Message):
     itb1 = "ИТБ1 (1.5)" if t1_avg >= 1.8 else "ИТБ1 (1.0)" if t1_avg >= 1.2 else "ИТБ1 (0.5)"
     itb2 = "ИТБ2 (1.5)" if t2_avg >= 1.8 else "ИТБ2 (1.0)" if t2_avg >= 1.2 else "ИТБ2 (0.5)"
 
-    await message.answer(f"📊 **{t1_name}**: {t1_avg} гола → {itb1}\n🚀 **{t2_name}**: {t2_avg} гола → {itb2}")
+    await message.answer(
+        f"📊 **{t1_found}**: {t1_avg} гола → {itb1}\n"
+        f"🚀 **{t2_found}**: {t2_avg} гола → {itb2}"
+    )
+
+# ==================== HEALTH + MAIN ====================
 
 async def health(request):
-    return web.Response(text="OK")
+    return web.Response(text="OK", status=200)
+
+async def on_startup(app):
+    logging.info("Server started")
 
 async def main():
     app = web.Application()
     app.router.add_get("/", health)
-    
-    webhook_path = "/webhook"
-    webhook_url = f"{os.getenv('WEBHOOK_URL', '')}{webhook_path}"
-    
-    if webhook_url and webhook_url != "/webhook":
-        # ===== WEBHOOK MODE =====
-        from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-        webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
-        webhook_handler.register(app, path=webhook_path)
-        setup_application(app, dp, bot=bot)
-        await bot.set_webhook(webhook_url)
-        logging.info(f"Webhook: {webhook_url}")
-        
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", 8080)
-        await site.start()
-        logging.info("Server on port 8080")
-        
-        # Бесконечное ожидание — сервер работает, webhook принимает запросы
-        while True:
-            await asyncio.sleep(3600)
-    else:
-        # ===== POLLING MODE =====
-        logging.info("Polling mode")
-        
-        # Запускаем health-сервер в фоне для проверки Bothost
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", 8080)
-        await site.start()
-        logging.info("Health server on port 8080")
-        
-        # polling БЛОКИРУЕТ выполнение — бот работает пока не упадёт
-        await dp.start_polling(bot, skip_updates=True)
+    app.on_startup.append(on_startup)
+
+    # === ЗАПУСК HEALTH-СЕРВЕРА ===
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", 8080)
+    await site.start()
+    logging.info("Health server on 0.0.0.0:8080")
+
+    # === ЗАПУСК POLLING ===
+    logging.info("Start polling")
+    await dp.start_polling(bot, skip_updates=True)
 
 if __name__ == "__main__":
     asyncio.run(main())
