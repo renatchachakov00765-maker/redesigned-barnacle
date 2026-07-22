@@ -43,14 +43,17 @@ def rate_limit():
 
 # === SESSION ===
 session = requests.Session()
-session.headers.update({"Connection": "close"})
+session.headers.update({
+    "Connection": "close",
+    "Accept": "application/json",
+    "User-Agent": "SStatsBot/1.0"
+})
 
 # === TEST API ===
 logging.info("=== TESTING API ===")
 
 test_urls = [
     ("api.sstats.net no key", "https://api.sstats.net/leagues", {}),
-    ("api.sstats.net with key", f"https://api.sstats.net/leagues?apikey={SSTATS_KEY or ''}", {}),
 ]
 
 for name, url, kwargs in test_urls:
@@ -87,18 +90,47 @@ main_kb = ReplyKeyboardMarkup(
 def api_get(endpoint: str, params: dict = None, retries: int = 3):
     url = f"{API_BASE_URL}{endpoint}"
     p = params or {}
+
+    # Ключ передаем в заголовках, не в URL
+    headers = {
+        "Connection": "close",
+        "Accept": "application/json",
+        "User-Agent": "SStatsBot/1.0"
+    }
     if SSTATS_KEY:
-        p["apikey"] = SSTATS_KEY
+        headers["apikey"] = SSTATS_KEY
 
     rate_limit()
 
     for attempt in range(retries):
         try:
-            response = session.get(url, params=p, timeout=15, headers={"Connection": "close"})
+            response = session.get(url, params=p, timeout=15, headers=headers)
             response.raise_for_status()
             data = response.json()
             logging.info(f"API OK {endpoint}: status={response.status_code}, keys={list(data.keys()) if isinstance(data, dict) else 'list'}, count={len(data) if isinstance(data, list) else (len(data.get('data', [])) if isinstance(data, dict) else 'N/A')}")
             return data
+        except requests.exceptions.ConnectionError as e:
+            logging.error(f"ConnectionError {endpoint} attempt {attempt+1}/{retries}: {e}")
+            if attempt == 0 and SSTATS_KEY:
+                # Fallback: пробуем без ключа
+                logging.info("Retrying without apikey in headers...")
+                try:
+                    fallback_headers = {
+                        "Connection": "close",
+                        "Accept": "application/json",
+                        "User-Agent": "SStatsBot/1.0"
+                    }
+                    response = session.get(url, params=p, timeout=15, headers=fallback_headers)
+                    response.raise_for_status()
+                    data = response.json()
+                    logging.info(f"API OK {endpoint} (fallback no key): status={response.status_code}")
+                    return data
+                except Exception as e2:
+                    logging.error(f"Fallback also failed: {e2}")
+            if attempt < retries - 1:
+                time.sleep(2 * (attempt + 1))
+            else:
+                return None
         except Exception as e:
             logging.error(f"API error {endpoint} attempt {attempt+1}/{retries}: {e}")
             if attempt < retries - 1:
@@ -119,6 +151,8 @@ def get_leagues():
         _leagues_cache_time = now
         logging.info(f"Loaded {len(_leagues_cache)} leagues")
         return _leagues_cache
+
+    logging.warning("Failed to load leagues or empty response")
     return []
 
 def get_team_id(team_name: str):
