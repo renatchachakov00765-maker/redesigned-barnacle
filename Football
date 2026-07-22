@@ -37,8 +37,8 @@ _cache_time = {}
 # === KEYBOARD ===
 main_kb = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="Scan matches today")],
-        [KeyboardButton(text="My recommendations")],
+        [KeyboardButton(text="Skanirovat matshi dnya")],
+        [KeyboardButton(text="Moi rekomendatsii")],
     ],
     resize_keyboard=True
 )
@@ -177,7 +177,7 @@ async def scan_matches(user_id: int):
     fixtures = get_today_fixtures()
 
     if not fixtures:
-        return None, "API returned no matches for today. Enter manually: `Team1 - Team2`"
+        return None, "API returned no matches for today. Enter manually: Team1 - Team2"
 
     recommendations = []
 
@@ -228,18 +228,18 @@ async def scan_matches(user_id: int):
     return recommendations, None
 
 # === HANDLERS ===
-@dp.message(F.text == "/start")
+@dp.message(F.text.lower().in_("/start", "start", "начать", "старт"))
 async def cmd_start(message: Message):
     await message.answer(
-        "Hello! I scan today's matches and look for high ITB 0.5 probability.\n\n"
-        "Press **Scan matches today** to see best options.",
+        "Hello! I scan today matches and look for high ITB 0.5 probability.\n\n"
+        "Press button below to scan or enter: Team1 - Team2",
         reply_markup=main_kb
     )
 
-@dp.message(F.text == "Scan matches today")
+@dp.message(F.text.lower().in_("skanirovat matshi dnya", "scan", "scan matches", "scan matches today"))
 async def scan_handler(message: Message):
     user_id = message.from_user.id
-    await message.answer("Scanning today's matches... This will take 10-20 seconds.")
+    await message.answer("Scanning today matches... Wait 10-20 seconds.")
 
     recommendations, error = await scan_matches(user_id)
 
@@ -250,7 +250,7 @@ async def scan_handler(message: Message):
     if not recommendations:
         await message.answer(
             "No matches today with ITB 0.5 probability >= 65%.\n"
-            "Try tomorrow or enter manually: `Team1 - Team2`"
+            "Try tomorrow or enter manually: Team1 - Team2"
         )
         return
 
@@ -268,13 +268,13 @@ async def scan_handler(message: Message):
 
     await message.answer(text)
 
-@dp.message(F.text == "My recommendations")
+@dp.message(F.text.lower().in_("moi rekomendatsii", "my recommendations", "recommendations"))
 async def show_recommendations(message: Message):
     user_id = message.from_user.id
     recs = _scan_results.get(user_id, [])
 
     if not recs:
-        await message.answer("First press **Scan matches today**")
+        await message.answer("First press Scan button")
         return
 
     text = f"Your recommendations ({len(recs)}):\n\n"
@@ -289,7 +289,7 @@ async def manual_analyze(message: Message):
     try:
         teams = message.text.split("-")
         if len(teams) != 2:
-            await message.answer("Format: `Team1 - Team2`")
+            await message.answer("Format: Team1 - Team2")
             return
 
         t1_name, t2_name = teams[0].strip(), teams[1].strip()
@@ -347,8 +347,7 @@ async def manual_analyze(message: Message):
 async def unknown(message: Message):
     await message.answer(
         "I did not understand.\n\n"
-        "Press **Scan matches today** for auto search\n"
-        "Or enter: `Team1 - Team2` for manual analysis"
+        "Press Scan button or enter: Team1 - Team2"
     )
 
 # === SERVER ===
