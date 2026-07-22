@@ -107,21 +107,36 @@ async def main():
     webhook_url = f"{os.getenv('WEBHOOK_URL', '')}{webhook_path}"
     
     if webhook_url and webhook_url != "/webhook":
+        # ===== WEBHOOK MODE =====
         from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
         webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
         webhook_handler.register(app, path=webhook_path)
         setup_application(app, dp, bot=bot)
         await bot.set_webhook(webhook_url)
         logging.info(f"Webhook: {webhook_url}")
+        
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", 8080)
+        await site.start()
+        logging.info("Server on port 8080")
+        
+        # Бесконечное ожидание — сервер работает, webhook принимает запросы
+        while True:
+            await asyncio.sleep(3600)
     else:
+        # ===== POLLING MODE =====
         logging.info("Polling mode")
-        asyncio.create_task(dp.start_polling(bot, skip_updates=True))
-    
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", 8080)
-    await site.start()
-    logging.info("Server on port 8080")
+        
+        # Запускаем health-сервер в фоне для проверки Bothost
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", 8080)
+        await site.start()
+        logging.info("Health server on port 8080")
+        
+        # polling БЛОКИРУЕТ выполнение — бот работает пока не упадёт
+        await dp.start_polling(bot, skip_updates=True)
 
 if __name__ == "__main__":
     asyncio.run(main())
