@@ -19,16 +19,12 @@ logging.basicConfig(
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("BOTTOKEN")
 SSTATS_KEY = os.getenv("SSTATS_KEY") or os.getenv("SSTATSKEY")
 
-logging.info(f"BOT_TOKEN найден: {'ДА' if BOT_TOKEN else 'НЕТ'}")
-logging.info(f"SSTATS_KEY найден: {'ДА' if SSTATS_KEY else 'НЕТ'}")
-
 API_BASE_URL = "https://sstats.net"
 
 if not BOT_TOKEN or not SSTATS_KEY:
-    logging.critical("Критические переменные BOT_TOKEN или SSTATS_KEY не найдены в панели!")
+    logging.critical("Переменные не найдены!")
     sys.exit(1)
 
-# Исправлено: добавлен DefaultBotProperties
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
 dp = Dispatcher()
 
@@ -39,115 +35,93 @@ main_kb = ReplyKeyboardMarkup(
 
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
-    logging.info(f"=== ПОЛУЧЕНО /start от {message.from_user.id} ===")
     await message.answer(
-        "👋 Привет! Я бот-аналитик футбольного **ИТБ** на базе SStats.\n"
-        "Отправь мне названия двух команд через дефис.\n"
-        "Пример: `Реал Мадрид - Барселона`", 
-        reply_markup=main_kb,
-        parse_mode="Markdown"
+        "👋 Привет! Отправь две команды через дефис.\nПример: `Реал Мадрид - Барселона`",
+        reply_markup=main_kb
     )
 
 @dp.message(F.text == "⚽ Анализ ИТБ")
 async def ask_teams(message: Message):
-    await message.answer("Введите две команды в формате: `Команда1 - Команда2`")
+    await message.answer("Введите: `Команда1 - Команда2`")
 
 def get_team_id(team_name: str):
     url = f"{API_BASE_URL}/teams/search"
     params = {"query": team_name.strip(), "api_key": SSTATS_KEY}
     try:
-        logging.info(f"SStats: Поиск команды {team_name}")
         response = requests.get(url, params=params, timeout=10).json()
         if response and isinstance(response, list) and len(response) > 0:
             return response[0]["id"], response[0]["name"]
     except Exception as e:
-        logging.error(f"Ошибка поиска в SStats для {team_name}: {e}")
+        logging.error(f"Ошибка: {e}")
     return None, None
 
 def get_average_goals(team_id: int):
     url = f"{API_BASE_URL}/teams/{team_id}/matches"
     params = {"limit": 5, "api_key": SSTATS_KEY}
     try:
-        logging.info(f"SStats: Запрос последних матчей для ID {team_id}")
         response = requests.get(url, params=params, timeout=10).json()
-        matches = response.get("matches", []) if isinstance(response, dict) else response
-        if not matches or not isinstance(matches, list):
+        matches = response.get("matches", []) if isinstance(response, dict) else []
+        if not matches:
             return 0.0
-            
-        total_goals = 0
-        games_counted = 0
-        for m in matches[:5]:
-            if m.get("home_team_id") == team_id:
-                total_goals += m.get("home_score", 0) or 0
-            else:
-                total_goals += m.get("away_score", 0) or 0
-            games_counted += 1
-        return round(total_goals / games_counted, 2) if games_counted > 0 else 0.0
+        total = sum(m.get("home_score", 0) if m.get("home_team_id") == team_id else m.get("away_score", 0) for m in matches[:5])
+        return round(total / len(matches[:5]), 2)
     except Exception as e:
-        logging.error(f"Ошибка подсчета голов в SStats для ID {team_id}: {e}")
+        logging.error(f"Ошибка: {e}")
         return 0.0
 
 @dp.message()
 async def analyze_match(message: Message):
     if "-" not in message.text:
         return
-
     teams = message.text.split("-")
     if len(teams) != 2:
-        await message.answer("❌ Используйте формат: Команда1 - Команда2")
+        await message.answer("❌ Формат: Команда1 - Команда2")
         return
 
-    t1_name = teams[0].strip()
-    t2_name = teams[1].strip()
-    
-    logging.info(f"Запрос анализа матча: {t1_name} - {t2_name}")
-    await message.answer(f"⏳ Запрашиваю базу SStats для {t1_name} и {t2_name}...")
+    t1_name, t2_name = teams[0].strip(), teams[1].strip()
+    await message.answer(f"⏳ Ищу {t1_name} и {t2_name}...")
 
-    t1_id, t1_correct_name = get_team_id(t1_name)
-    t2_id, t2_correct_name = get_team_id(t2_name)
+    t1_id, t1_name = get_team_id(t1_name)
+    t2_id, t2_name = get_team_id(t2_name)
 
     if not t1_id or not t2_id:
-        await message.answer("❌ Одна из команд не найдена в базе SStats. Проверьте правильность написания.")
+        await message.answer("❌ Команда не найдена")
         return
 
     t1_avg = get_average_goals(t1_id)
     t2_avg = get_average_goals(t2_id)
 
-    itb1_suggestion = "ИТБ1 (1.0)" if t1_avg >= 1.2 else "ИТБ1 (0.5)"
-    if t1_avg >= 1.8: itb1_suggestion = "ИТБ1 (1.5)"
+    itb1 = "ИТБ1 (1.5)" if t1_avg >= 1.8 else "ИТБ1 (1.0)" if t1_avg >= 1.2 else "ИТБ1 (0.5)"
+    itb2 = "ИТБ2 (1.5)" if t2_avg >= 1.8 else "ИТБ2 (1.0)" if t2_avg >= 1.2 else "ИТБ2 (0.5)"
 
-    itb2_suggestion = "ИТБ2 (1.0)" if t2_avg >= 1.2 else "ИТБ2 (0.5)"
-    if t2_avg >= 1.8: itb2_suggestion = "ИТБ2 (1.5)"
-
-    report = (
-        f"📊 **Анализ индивидуального тотала (SStats API):**\n\n"
-        f"🏠 **{t1_correct_name}**:\n"
-        f"• Средний тотал за 5 игр: {t1_avg} гола(ов)\n"
-        f"• Прогноз: **{itb1_suggestion}**\n\n"
-        f"🚀 **{t2_correct_name}**:\n"
-        f"• Средний тотал за 5 игр: {t2_avg} гола(ов)\n"
-        f"• Прогноз: **{itb2_suggestion}**"
-    )
-    await message.answer(report, parse_mode="Markdown")
+    await message.answer(f"📊 **{t1_name}**: {t1_avg} гола → {itb1}\n🚀 **{t2_name}**: {t2_avg} гола → {itb2}")
 
 async def health(request):
     return web.Response(text="OK")
 
-async def start_web():
+async def main():
     app = web.Application()
     app.router.add_get("/", health)
+    
+    webhook_path = "/webhook"
+    webhook_url = f"{os.getenv('WEBHOOK_URL', '')}{webhook_path}"
+    
+    if webhook_url and webhook_url != "/webhook":
+        from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+        webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
+        webhook_handler.register(app, path=webhook_path)
+        setup_application(app, dp, bot=bot)
+        await bot.set_webhook(webhook_url)
+        logging.info(f"Webhook: {webhook_url}")
+    else:
+        logging.info("Polling mode")
+        asyncio.create_task(dp.start_polling(bot, skip_updates=True))
+    
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", 8080)
     await site.start()
-    logging.info("Web server started on port 8080")
-
-async def main():
-    logging.info("--- ЗАПУСК БОТА ---")
-    await asyncio.gather(
-        dp.start_polling(bot, skip_updates=True),  # Исправлено: skip_updates=True
-        start_web()
-    )
+    logging.info("Server on port 8080")
 
 if __name__ == "__main__":
     asyncio.run(main())
