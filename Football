@@ -1,9 +1,12 @@
+
 import os
 import sys
 import logging
 import requests
 import asyncio
+import time
 from datetime import datetime, timedelta
+from collections import deque
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.client.default import DefaultBotProperties
@@ -24,28 +27,41 @@ if not BOT_TOKEN:
     logging.critical("BOT_TOKEN not found!")
     sys.exit(1)
 
-# === TEST API CONNECTIVITY ON STARTUP ===
+# === RATE LIMITER: max 10 requests per minute ===
+_request_times = deque()
+MAX_RPM = 10
+
+def rate_limit():
+    now = time.time()
+    # Remove requests older than 60 seconds
+    while _request_times and now - _request_times[0] > 60:
+        _request_times.popleft()
+
+    if len(_request_times) >= MAX_RPM:
+        sleep_time = 60 - (now - _request_times[0]) + 1
+        logging.warning(f"Rate limit hit. Sleeping {sleep_time:.1f}s")
+        time.sleep(max(sleep_time, 1))
+
+    _request_times.append(time.time())
+
+# === SESSION ===
+session = requests.Session()
+session.headers.update({"Connection": "close"})
+
+# === TEST API CONNECTIVITY ===
 logging.info("=== TESTING API CONNECTIVITY ===")
 
 test_urls = [
     ("api.sstats.net no key", "https://api.sstats.net/leagues", {}),
-    ("sstats.net no key", "https://sstats.net/leagues", {}),
     ("api.sstats.net with key", f"https://api.sstats.net/leagues?apikey={SSTATS_KEY or ''}", {}),
 ]
 
 for name, url, kwargs in test_urls:
     try:
-        r = requests.get(url, timeout=10, **kwargs)
+        r = session.get(url, timeout=10, **kwargs)
         logging.info(f"TEST OK [{name}]: status={r.status_code}, len={len(r.text)}")
     except Exception as e:
         logging.error(f"TEST FAIL [{name}]: {type(e).__name__}: {e}")
-
-# Test with verify=False
-try:
-    r = requests.get("https://api.sstats.net/leagues", verify=False, timeout=10)
-    logging.info(f"TEST OK [api.sstats.net verify=False]: status={r.status_code}, len={len(r.text)}")
-except Exception as e:
-    logging.error(f"TEST FAIL [api.sstats.net verify=False]: {type(e).__name__}: {e}")
 
 logging.info("=== END API TESTS ===")
 
@@ -55,9 +71,9 @@ bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
 dp = Dispatcher()
 
 # === CACHE ===
-_team_cache = {}
-_matches_cache = {}
-_cache_time = {}
+_team_cache = {}      # name -> (id, name)
+_matches_cache = {}   # team_id -> [(match, goals)]
+_cache_time = {}      # team_id -> timestamp
 
 # === KEYBOARD ===
 main_kb = ReplyKeyboardMarkup(
@@ -68,19 +84,26 @@ main_kb = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-# === API SSTATS ===
-def api_get(endpoint: str, params: dict = None):
+# === API SSTATS WITH RATE LIMIT + RETRY ===
+def api_get(endpoint: str, params: dict = None, retries: int = 3):
     url = f"{API_BASE_URL}{endpoint}"
     p = params or {}
     if SSTATS_KEY:
         p["apikey"] = SSTATS_KEY
-    try:
-        response = requests.get(url, params=p, timeout=10)
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        logging.error(f"API error {endpoint}: {e}")
-        return None
+
+    rate_limit()  # Wait if rate limit hit
+
+    for attempt in range(retries):
+        try:
+            response = session.get(url, params=p, timeout=15, headers={"Connection": "close"})
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logging.error(f"API error {endpoint} attempt {attempt+1}/{retries}: {e}")
+            if attempt < retries - 1:
+                time.sleep(2 * (attempt + 1))  # backoff: 2s, 4s, 6s
+            else:
+                return None
 
 def get_team_id(team_name: str):
     key = team_name.lower().strip()
@@ -145,13 +168,13 @@ def get_team_matches(team_id: int, limit: int = 10, is_home: bool = None):
     _cache_time[cache_key] = now
     return result
 
-def get_today_fixtures():
+def get_today_fixtures(max_matches: int = 10):
     today = datetime.now().strftime("%Y-%m-%d")
 
     data = api_get("/Games/list", {
         "Date": today,
         "Upcoming": "true",
-        "Limit": 100,
+        "Limit": max_matches,
     })
 
     if data and data.get("status") == "ok" and data.get("data"):
@@ -199,7 +222,7 @@ def calculate_advanced_itb(team_id: int, is_home: bool):
 _scan_results = {}
 
 async def scan_matches(user_id: int):
-    fixtures = get_today_fixtures()
+    fixtures = get_today_fixtures(max_matches=10)  # Limit to 10 matches
 
     if not fixtures:
         return None, "API returned no matches for today. Enter manually: Team1 - Team2"
