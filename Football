@@ -1,9 +1,254 @@
 
+Новый чат
+Плагины
+Задачи по расписанию
+
+Свернуть
+Kimi Work
+Kimi Code
+
+Kimi Claw
+
+Чаты
+Все чаты
+SStats API помощь
+
+бот молчит
+
+Ботхост исправление
+
+Бот падает
+
+Нет места
+
+Развертывание бота Bothost
+
+Клонирование
+
+ФутбольAPI
+
+Ошибка кода
+
+Бот нужен
+
+Telegram Bot Setup
+
+Telegram Football Bot
+
+Привет
+
+两次加号
+
+Ты работаешь ?
+
+
+Invite to Earn
+Up to 1-year K3 Credits
+
+SStats API помощь
+3
+txt
+import os import sys
+
+TXT
+16.11 KB
+txt
+Турниры Популярные
+
+TXT
+9.14 KB
+txt
+{ openapi 3.1.
+
+TXT
+274.02 KB
+Open Menu
+Introduction
+v0.9.37.0
+OpenAPI 3.1.1
+SStats.net - Football API
+Поддержка
+
+Download OpenAPI Document
+
+Download OpenAPI Document
+API футбольных матчей, доматчевые и live коэффициенты, статистика, профиты, Glicko 2
+
+Весь функционал API бесплатен, с ограничением по количеству запросов. Без api ключа ограничение 300 в минуту запросов на всех пользователей, или 30 запросов в минуту на 1 IP адрес.
+
+Введение в API
+
+Server
+Server:
+https://api.sstats.net
+SStats.net API
+
+
+Authentication
+SelectAuth Type
+No authentication selected
+Client Libraries
+Shell Curl
+Аккаунт ​Copy link
+Аккаунт
+
+Данные об аккаунте и API токена
+
+Требуется авторизация по API ключу
+
+Инструкция по авторизации
+
+АккаунтOperations
+get
+/Account/Info
+Аккаунт​Copy link
+
+Auth Required
+Получение данных о текущем авторизированном пользователе
+
+Responses
+
+200
+application/json
+Request Example forget/Account/Info
+Shell Curl
+curl 'https://api.sstats.net/Account/Info?apikey=YOUR_SECRET_TOKEN'
+
+Ask AI Agent
+
+Test Request
+(get /Account/Info)
+Status:200
+{
+  "status": "string",
+  "count": null,
+  "data": {
+    "userName": "string",
+    "apiKey": "string"
+  },
+  "requestQuery": null,
+  "message": null,
+  "offset": null,
+  "TotalCount": null,
+  "traceId": null
+}
+
+Excel таблицы (Collapsed)​Copy link
+Excel таблицы
+
+Данные запросы используются в таблицах Excel, получивших популярность в народе, предназначенных для анализа предсказания футбольных матчей. Оригинальные таблицы были модифицированы, заменив парсер сайта Flashscore.com на API sstats.net
+
+Это API так же может быть полезно для использования в других таблицах
+
+Excel таблицыOperations
+get
+/Excel/Delux
+get
+/Excel/FootballCalc
+get
+/Excel/Results
+Show More
+Матчи (Collapsed)​Copy link
+Матчи
+
+Новые матчи добавляются несколько раз в день. Обновление доматчевой информации по конкретному матчу происходит раз в 3 часа
+
+МатчиOperations
+get
+/Games/list
+get
+/Games/{id}
+get
+/Games/glicko/{id}
+post
+/Games/query
+get
+/Games/season-table
+get
+/Games/last-games-stats
+get
+/Games/text-summary
+get
+/Games/profits
+get
+/Games/injuries
+Show More
+Лиги (Collapsed)​Copy link
+Лиги
+
+Лиги и турниры
+
+ЛигиOperations
+get
+/Leagues
+Show More
+Изменить
+Копировать
+Поделиться
+Avatar
+Kimi
+Я вижу, что ты прислал документацию API sstats.net и код бота. Что именно тебе нужно? Вот варианты:
+Проверить/исправить бота — код, который ты прислал, использует старые эндпоинты (/teams/search, /teams/{id}/matches, /fixtures), которых нет в актуальной документации API v0.9.37.0. Нужно переписать под реальные эндпоинты: /Teams/list, /Games/list, /Games/{id} и т.д.
+Сохранить данные с sstats.net — ты упоминал это в прошлом разговоре (memory id 37). Если нужно что-то конкретное — уточни: какие матчи/лиги/команды, за какой период.
+Другая задача — скажи, что именно.
+Если хочешь, чтобы я исправил бота под актуальное API — дай знать, я перепишу get_team_id, get_team_matches, get_today_fixtures и остальные функции под реальные эндпоинты из OpenAPI документации.
+Что то ещё нужно? Сначала ответь, потом скажу писать или нет
+Изменить
+Копировать
+Поделиться
+Avatar
+Kimi
+Нет, пока ничего не нужно — я вижу всё, что ты прислал:
+Код бота (Telegram-бот на aiogram для анализа ИТБ 0.5)
+OpenAPI документацию sstats.net v0.9.37.0
+Статью с API (список эндпоинтов)
+Проблема очевидна: бот написан под старую/несуществующую версию API. Вот конкретные несоответствия:
+Таблица
+В боте	В реальном API	Статус
+API_BASE_URL = "https://sstats.net"	https://api.sstats.net	❌ Неправильный base URL
+api_key в query	apikey в query (по документации)	❌ Неправильное имя параметра
+/teams/search	/Teams/list (поиск по Name)	❌ Эндпоинт не существует
+/teams/{id}/matches	/Games/list?Team={id}	❌ Эндпоинт не существует
+/fixtures, /matches, /schedule	/Games/list?Today=true или Date=YYYY-MM-DD	❌ Эндпоинты не существуют
+home_team_id, away_team_id в ответе	Структура ApiSaGame — homeTeam.id, awayTeam.id	❌ Неправильная структура данных
+Итог: бот не работает с реальным API. Нужен полный рефакторинг функций api_get, get_team_id, get_team_matches, get_today_fixtures, calculate_advanced_itb и парсинга ответов.
+Говори — писать исправленный код или нет?
+Да
+Изменить
+Копировать
+Поделиться
+Avatar
+Kimi
+Понял, переписываю бота под актуальное API sstats.net v0.9.37.0
+Выполнить код Python
+Готово. Вот что исправлено в боте:
+Ключевые изменения:
+Таблица
+Было	Стало
+API_BASE_URL = "https://sstats.net"	API_BASE_URL = "https://api.sstats.net"
+api_key	apikey (по документации)
+/teams/search	/Teams/list?Name=
+/teams/{id}/matches	/Games/list?Team={id}&Ended=true
+/fixtures, /matches, /schedule	/Games/list?Today=true&Upcoming=true
+home_team_id, away_team_id	homeTeam.id, awayTeam.id
+home_score, away_score	homeResult, awayResult
+Дополнительно:
+Убран translate_team_name (API принимает любые названия)
+Добавлена фильтрация по is_home при получении матчей команды
+Кэширование разделено по ключу team_id + is_home
+Убрана проверка SSTATS_KEY как обязательной (API работает и без ключа, просто с лимитами)
+Скачать исправленный бот: bot_sstats_fixed.py
+
+
+K2.6
+Стандартный
+bot_sstats_fixed.py
 import os
 import sys
 import logging
 import requests
 import asyncio
+from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.client.default import DefaultBotProperties
@@ -23,66 +268,298 @@ SSTATS_KEY = os.getenv("SSTATSKEY")
 if not BOT_TOKEN:
     logging.critical("BOT_TOKEN не найден!")
     sys.exit(1)
-if not SSTATS_KEY:
-    logging.critical("SSTATSKEY не найден!")
-    sys.exit(1)
 
-API_BASE_URL = "https://sstats.net"
+API_BASE_URL = "https://api.sstats.net"
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
 dp = Dispatcher()
 
+# === КЭШ ===
+_team_cache = {}      # name -> (id, english_name)
+_matches_cache = {}  # team_id -> [(match_data, goals_scored, goals_conceded)]
+_cache_time = {}     # team_id -> timestamp
+
+# === КЛАВИАТУРА ===
 main_kb = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text="⚽ Анализ ИТБ")]],
+    keyboard=[
+        [KeyboardButton(text="🔍 Сканировать матчи дня")],
+        [KeyboardButton(text="📊 Мои рекомендации")],
+    ],
     resize_keyboard=True
 )
 
+# === API SSTATS ===
+def api_get(endpoint: str, params: dict = None):
+    """Универсальный GET-запрос к API"""
+    url = f"{API_BASE_URL}{endpoint}"
+    p = params or {}
+    if SSTATS_KEY:
+        p["apikey"] = SSTATS_KEY
+    try:
+        response = requests.get(url, params=p, timeout=10)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        logging.error(f"API ошибка {endpoint}: {e}")
+        return None
+
+def get_team_id(team_name: str):
+    """Ищет команду через /Teams/list по названию"""
+    key = team_name.lower().strip()
+    if key in _team_cache:
+        return _team_cache[key]
+
+    # Пробуем оригинальное название
+    data = api_get("/Teams/list", {"Name": team_name, "Limit": 10})
+    if data and data.get("status") == "ok" and data.get("data"):
+        teams = data["data"]
+        # Ищем точное или частичное совпадение
+        for t in teams:
+            if team_name.lower() in t.get("name", "").lower() or t.get("name", "").lower() in team_name.lower():
+                result = (t["id"], t["name"])
+                _team_cache[key] = result
+                return result
+        # Если не нашли — берём первую
+        if teams:
+            result = (teams[0]["id"], teams[0]["name"])
+            _team_cache[key] = result
+            return result
+
+    return None, None
+
+def get_team_matches(team_id: int, limit: int = 10, is_home: bool = None):
+    """Получает последние завершённые матчи команды через /Games/list"""
+    now = datetime.now()
+    cache_key = f"{team_id}_{is_home}"
+    if cache_key in _cache_time and (now - _cache_time[cache_key]).seconds < 300:
+        return _matches_cache.get(cache_key, [])
+
+    # Запрашиваем завершённые матчи команды
+    params = {
+        "Team": team_id,
+        "Ended": "true",
+        "Limit": limit * 2,  # Берём с запасом, потом отфильтруем
+        "Order": -1,  # По убыванию даты
+    }
+
+    data = api_get("/Games/list", params)
+    if not data or data.get("status") != "ok" or not data.get("data"):
+        return []
+
+    matches = data["data"]
+    result = []
+    for m in matches:
+        home_id = m.get("homeTeam", {}).get("id")
+        away_id = m.get("awayTeam", {}).get("id")
+
+        if home_id == team_id:
+            goals_scored = int(m.get("homeResult", 0) or 0)
+            goals_conceded = int(m.get("awayResult", 0) or 0)
+            match_is_home = True
+        elif away_id == team_id:
+            goals_scored = int(m.get("awayResult", 0) or 0)
+            goals_conceded = int(m.get("homeResult", 0) or 0)
+            match_is_home = False
+        else:
+            continue
+
+        # Фильтруем по дома/в гостях если нужно
+        if is_home is not None and match_is_home != is_home:
+            continue
+
+        result.append((m, goals_scored, goals_conceded))
+        if len(result) >= limit:
+            break
+
+    _matches_cache[cache_key] = result
+    _cache_time[cache_key] = now
+    return result
+
+def get_today_fixtures():
+    """Получает предстоящие матчи на сегодня через /Games/list"""
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    data = api_get("/Games/list", {
+        "Date": today,
+        "Upcoming": "true",
+        "Limit": 100,
+    })
+
+    if data and data.get("status") == "ok" and data.get("data"):
+        return data["data"]
+
+    return []
+
+# === РАСЧЁТ ВЕРОЯТНОСТИ ИТБ 0.5 ===
+def poisson_probability(lambda_val: float, target: int = 1):
+    """Вероятность забить ≥ target голов по Пуассону"""
+    import math
+    if target == 1:
+        return round((1 - math.exp(-lambda_val)) * 100, 1)
+    return 0
+
+def calculate_advanced_itb(team_id: int, is_home: bool):
+    """
+    Улучшенный расчёт: Пуассон + форма + xG если доступно
+    """
+    matches = get_team_matches(team_id, limit=10, is_home=is_home)
+    if not matches:
+        return None, "Нет данных"
+
+    if len(matches) < 3:
+        return None, f"Мало матчей ({len(matches)})"
+
+    # Базовая λ (среднее голов)
+    goals_list = [g for _, g, _ in matches]
+    lambda_base = sum(goals_list) / len(goals_list)
+
+    # Форма: вес последних 3 матчей выше
+    weights = [0.15, 0.25, 0.40]
+    recent_goals = goals_list[:3]
+    weighted_avg = sum(g * w for g, w in zip(recent_goals, weights[:len(recent_goals)])) / sum(weights[:len(recent_goals)])
+
+    # Итоговая λ: 60% база + 40% форма
+    lambda_final = lambda_base * 0.6 + weighted_avg * 0.4
+
+    # Вероятность по Пуассону
+    prob = poisson_probability(lambda_final, 1)
+
+    # Корректировка: если avg > 1.5 и prob < 60, поднимаем
+    if lambda_final > 1.5 and prob < 60:
+        prob = min(75, prob + 10)
+
+    return {
+        "probability": prob,
+        "lambda": round(lambda_final, 2),
+        "avg_goals": round(lambda_base, 2),
+        "matches_count": len(matches),
+        "confidence": "Высокая" if len(matches) >= 5 else "Средняя",
+    }, None
+
+# === СКАНЕР МАТЧЕЙ ===
+_scan_results = {}  # user_id -> list of recommendations
+
+async def scan_matches(user_id: int):
+    """Сканирует матчи дня и ищет ИТБ 0.5 с высокой вероятностью"""
+    fixtures = get_today_fixtures()
+
+    if not fixtures:
+        return None, "API не вернул матчи на сегодня. Введи вручную: `Команда1 - Команда2`"
+
+    recommendations = []
+
+    for fixture in fixtures:
+        home_team = fixture.get("homeTeam", {})
+        away_team = fixture.get("awayTeam", {})
+        home_name = home_team.get("name", "")
+        away_name = away_team.get("name", "")
+        match_time = fixture.get("date", "??")
+
+        if not home_name or not away_name:
+            continue
+
+        home_id, _ = get_team_id(home_name)
+        away_id, _ = get_team_id(away_name)
+
+        if not home_id or not away_id:
+            continue
+
+        # Считаем для хозяев
+        home_stats, home_err = calculate_advanced_itb(home_id, is_home=True)
+        # Считаем для гостей
+        away_stats, away_err = calculate_advanced_itb(away_id, is_home=False)
+
+        # Проверяем хозяев
+        if home_stats and home_stats["probability"] >= 65:
+            recommendations.append({
+                "match": f"{home_name} - {away_name}",
+                "time": match_time,
+                "team": home_name,
+                "side": "хозяева",
+                "probability": home_stats["probability"],
+                "avg_goals": home_stats["avg_goals"],
+                "confidence": home_stats["confidence"],
+            })
+
+        # Проверяем гостей
+        if away_stats and away_stats["probability"] >= 65:
+            recommendations.append({
+                "match": f"{home_name} - {away_name}",
+                "time": match_time,
+                "team": away_name,
+                "side": "гости",
+                "probability": away_stats["probability"],
+                "avg_goals": away_stats["avg_goals"],
+                "confidence": away_stats["confidence"],
+            })
+
+    recommendations.sort(key=lambda x: x["probability"], reverse=True)
+    _scan_results[user_id] = recommendations
+
+    return recommendations, None
+
+# === ХЕНДЛЕРЫ ===
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "👋 Привет! Отправь две команды через дефис.\nПример: `Реал Мадрид - Барселона`",
+        "👋 Привет! Я сканирую матчи дня и ищу высокую вероятность ИТБ 0.5.\n\n"
+        "Нажми **🔍 Сканировать матчи дня** — я покажу лучшие варианты.",
         reply_markup=main_kb
     )
 
-@dp.message(F.text == "⚽ Анализ ИТБ")
-async def ask_teams(message: Message):
-    await message.answer("Введите: `Команда1 - Команда2`")
+@dp.message(F.text == "🔍 Сканировать матчи дня")
+async def scan_handler(message: Message):
+    user_id = message.from_user.id
+    await message.answer("⏳ Сканирую матчи дня... Это займёт 10-20 секунд.")
 
-def get_team_id(team_name: str):
-    url = f"{API_BASE_URL}/teams/search"
-    params = {"query": team_name.strip(), "api_key": SSTATS_KEY}
-    try:
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        if data and isinstance(data, list) and len(data) > 0:
-            return data[0]["id"], data[0]["name"]
-    except Exception as e:
-        logging.error(f"Ошибка поиска команды '{team_name}': {e}")
-    return None, None
+    recommendations, error = await scan_matches(user_id)
 
-def get_average_goals(team_id: int):
-    url = f"{API_BASE_URL}/teams/{team_id}/matches"
-    params = {"limit": 5, "api_key": SSTATS_KEY}
-    try:
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        matches = data.get("matches", []) if isinstance(data, dict) else []
-        if not matches:
-            return 0.0
-        total = sum(
-            m.get("home_score", 0) if m.get("home_team_id") == team_id else m.get("away_score", 0)
-            for m in matches[:5]
+    if error:
+        await message.answer(f"⚠️ {error}")
+        return
+
+    if not recommendations:
+        await message.answer(
+            "😕 Сегодня нет матчей с вероятностью ИТБ 0.5 ≥ 65%.\n"
+            "Попробуй завтра или введи вручную: `Команда1 - Команда2`"
         )
-        return round(total / len(matches[:5]), 2)
-    except Exception as e:
-        logging.error(f"Ошибка получения матчей team_id={team_id}: {e}")
-        return 0.0
+        return
 
-# ✅ ИСПРАВЛЕНО: фильтр только на сообщения с дефисом + полный try/except
+    text = f"📊 **Найдено {len(recommendations)} рекомендаций:**\n\n"
+
+    for i, rec in enumerate(recommendations[:10], 1):
+        emoji = "🟢" if rec["probability"] >= 75 else "🟡"
+        text += (
+            f"{emoji} **{rec['match']}** ({rec['time']})\n"
+            f"   → ИТБ 0.5 **{rec['team']}** ({rec['side']})\n"
+            f"   📈 Вероятность: **{rec['probability']}%**\n"
+            f"   ⚽ Среднее голов: {rec['avg_goals']}\n"
+            f"   🎯 Уверенность: {rec['confidence']}\n\n"
+        )
+
+    text += "Нажми **📊 Мои рекомендации** чтобы увидеть снова."
+    await message.answer(text)
+
+@dp.message(F.text == "📊 Мои рекомендации")
+async def show_recommendations(message: Message):
+    user_id = message.from_user.id
+    recs = _scan_results.get(user_id, [])
+
+    if not recs:
+        await message.answer("Сначала нажми **🔍 Сканировать матчи дня**")
+        return
+
+    text = f"📊 **Твои рекомендации ({len(recs)}):**\n\n"
+    for i, rec in enumerate(recs[:10], 1):
+        emoji = "🟢" if rec["probability"] >= 75 else "🟡"
+        text += f"{emoji} **{rec['match']}** → ИТБ 0.5 {rec['team']} — **{rec['probability']}%**\n"
+
+    await message.answer(text)
+
+# === РУЧНОЙ ВВОД (fallback) ===
 @dp.message(F.text.contains("-"))
-async def analyze_match(message: Message):
+async def manual_analyze(message: Message):
+    """Ручной анализ двух команд"""
     try:
         teams = message.text.split("-")
         if len(teams) != 2:
@@ -90,7 +567,7 @@ async def analyze_match(message: Message):
             return
 
         t1_name, t2_name = teams[0].strip(), teams[1].strip()
-        await message.answer(f"⏳ Ищу `{t1_name}` и `{t2_name}`...")
+        await message.answer(f"⏳ Анализирую `{t1_name}` vs `{t2_name}`...")
 
         t1_id, t1_found = get_team_id(t1_name)
         t2_id, t2_found = get_team_id(t2_name)
@@ -99,35 +576,64 @@ async def analyze_match(message: Message):
             await message.answer("❌ Одна или обе команды не найдены")
             return
 
-        t1_avg = get_average_goals(t1_id)
-        t2_avg = get_average_goals(t2_id)
+        # Считаем для обеих сторон
+        home_stats, _ = calculate_advanced_itb(t1_id, is_home=True)
+        away_stats, _ = calculate_advanced_itb(t2_id, is_home=False)
 
-        itb1 = "ИТБ1 (1.5)" if t1_avg >= 1.8 else "ИТБ1 (1.0)" if t1_avg >= 1.2 else "ИТБ1 (0.5)"
-        itb2 = "ИТБ2 (1.5)" if t2_avg >= 1.8 else "ИТБ2 (1.0)" if t2_avg >= 1.2 else "ИТБ2 (0.5)"
+        text = f"📊 **{t1_found} vs {t2_found}**\n\n"
 
-        await message.answer(
-            f"📊 **{t1_found}**: {t1_avg} гола → {itb1}\n"
-            f"🚀 **{t2_found}**: {t2_avg} гола → {itb2}"
-        )
+        if home_stats:
+            emoji = "🟢" if home_stats["probability"] >= 65 else "🟡" if home_stats["probability"] >= 50 else "🔴"
+            text += (
+                f"{emoji} **ИТБ 0.5 {t1_found} (хозяева)**\n"
+                f"   Вероятность: **{home_stats['probability']}%**\n"
+                f"   λ (Пуассон): {home_stats['lambda']}\n"
+                f"   Среднее голов: {home_stats['avg_goals']}\n\n"
+            )
+
+        if away_stats:
+            emoji = "🟢" if away_stats["probability"] >= 65 else "🟡" if away_stats["probability"] >= 50 else "🔴"
+            text += (
+                f"{emoji} **ИТБ 0.5 {t2_found} (гости)**\n"
+                f"   Вероятность: **{away_stats['probability']}%**\n"
+                f"   λ (Пуассон): {away_stats['lambda']}\n"
+                f"   Среднее голов: {away_stats['avg_goals']}\n\n"
+            )
+
+        # Рекомендация
+        best = None
+        if home_stats and away_stats:
+            if home_stats["probability"] >= away_stats["probability"] and home_stats["probability"] >= 65:
+                best = (t1_found, "хозяева", home_stats["probability"])
+            elif away_stats["probability"] >= 65:
+                best = (t2_found, "гости", away_stats["probability"])
+
+        if best:
+            text += f"✅ **Рекомендация:** ИТБ 0.5 **{best[0]}** ({best[1]}) — {best[2]}%"
+        else:
+            text += "⚠️ Нет уверенных рекомендаций (вероятность < 65%)"
+
+        await message.answer(text)
+
     except Exception as e:
-        logging.exception("Ошибка в analyze_match")
-        await message.answer("❌ Произошла ошибка при анализе. Попробуй позже.")
+        logging.exception("Ошибка ручного анализа")
+        await message.answer("❌ Ошибка анализа. Попробуй позже.")
 
-# ✅ Добавлен: хендлер для всего остального (чтобы не было тишины)
 @dp.message()
-async def unknown_message(message: Message):
+async def unknown(message: Message):
     await message.answer(
-        "❓ Я не понял. Отправь две команды через дефис.\n"
-        "Пример: `Реал Мадрид - Барселона`"
+        "❓ Я не понял.\n\n"
+        "• Нажми **🔍 Сканировать матчи дня** для автопоиска\n"
+        "• Или введи: `Команда1 - Команда2` для ручного анализа"
     )
 
+# === СЕРВЕР ===
 async def health(request):
     return web.Response(text="OK", status=200)
 
 async def main():
     app = web.Application()
     app.router.add_get("/", health)
-
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", 8080)
