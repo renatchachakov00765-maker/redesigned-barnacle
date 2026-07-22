@@ -24,6 +24,31 @@ if not BOT_TOKEN:
     logging.critical("BOT_TOKEN not found!")
     sys.exit(1)
 
+# === TEST API CONNECTIVITY ON STARTUP ===
+logging.info("=== TESTING API CONNECTIVITY ===")
+
+test_urls = [
+    ("api.sstats.net no key", "https://api.sstats.net/leagues", {}),
+    ("sstats.net no key", "https://sstats.net/leagues", {}),
+    ("api.sstats.net with key", f"https://api.sstats.net/leagues?apikey={SSTATS_KEY or ''}", {}),
+]
+
+for name, url, kwargs in test_urls:
+    try:
+        r = requests.get(url, timeout=10, **kwargs)
+        logging.info(f"TEST OK [{name}]: status={r.status_code}, len={len(r.text)}")
+    except Exception as e:
+        logging.error(f"TEST FAIL [{name}]: {type(e).__name__}: {e}")
+
+# Test with verify=False
+try:
+    r = requests.get("https://api.sstats.net/leagues", verify=False, timeout=10)
+    logging.info(f"TEST OK [api.sstats.net verify=False]: status={r.status_code}, len={len(r.text)}")
+except Exception as e:
+    logging.error(f"TEST FAIL [api.sstats.net verify=False]: {type(e).__name__}: {e}")
+
+logging.info("=== END API TESTS ===")
+
 API_BASE_URL = "https://api.sstats.net"
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
