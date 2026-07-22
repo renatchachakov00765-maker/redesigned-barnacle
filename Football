@@ -1,3 +1,4 @@
+
 import os
 import sys
 import logging
@@ -79,34 +80,45 @@ def get_average_goals(team_id: int):
         logging.error(f"Ошибка получения матчей team_id={team_id}: {e}")
         return 0.0
 
-@dp.message()
+# ✅ ИСПРАВЛЕНО: фильтр только на сообщения с дефисом + полный try/except
+@dp.message(F.text.contains("-"))
 async def analyze_match(message: Message):
-    if "-" not in message.text:
-        return
-    teams = message.text.split("-")
-    if len(teams) != 2:
-        await message.answer("❌ Формат: Команда1 - Команда2")
-        return
+    try:
+        teams = message.text.split("-")
+        if len(teams) != 2:
+            await message.answer("❌ Формат: `Команда1 - Команда2`")
+            return
 
-    t1_name, t2_name = teams[0].strip(), teams[1].strip()
-    await message.answer(f"⏳ Ищу {t1_name} и {t2_name}...")
+        t1_name, t2_name = teams[0].strip(), teams[1].strip()
+        await message.answer(f"⏳ Ищу `{t1_name}` и `{t2_name}`...")
 
-    t1_id, t1_found = get_team_id(t1_name)
-    t2_id, t2_found = get_team_id(t2_name)
+        t1_id, t1_found = get_team_id(t1_name)
+        t2_id, t2_found = get_team_id(t2_name)
 
-    if not t1_id or not t2_id:
-        await message.answer("❌ Одна или обе команды не найдены")
-        return
+        if not t1_id or not t2_id:
+            await message.answer("❌ Одна или обе команды не найдены")
+            return
 
-    t1_avg = get_average_goals(t1_id)
-    t2_avg = get_average_goals(t2_id)
+        t1_avg = get_average_goals(t1_id)
+        t2_avg = get_average_goals(t2_id)
 
-    itb1 = "ИТБ1 (1.5)" if t1_avg >= 1.8 else "ИТБ1 (1.0)" if t1_avg >= 1.2 else "ИТБ1 (0.5)"
-    itb2 = "ИТБ2 (1.5)" if t2_avg >= 1.8 else "ИТБ2 (1.0)" if t2_avg >= 1.2 else "ИТБ2 (0.5)"
+        itb1 = "ИТБ1 (1.5)" if t1_avg >= 1.8 else "ИТБ1 (1.0)" if t1_avg >= 1.2 else "ИТБ1 (0.5)"
+        itb2 = "ИТБ2 (1.5)" if t2_avg >= 1.8 else "ИТБ2 (1.0)" if t2_avg >= 1.2 else "ИТБ2 (0.5)"
 
+        await message.answer(
+            f"📊 **{t1_found}**: {t1_avg} гола → {itb1}\n"
+            f"🚀 **{t2_found}**: {t2_avg} гола → {itb2}"
+        )
+    except Exception as e:
+        logging.exception("Ошибка в analyze_match")
+        await message.answer("❌ Произошла ошибка при анализе. Попробуй позже.")
+
+# ✅ Добавлен: хендлер для всего остального (чтобы не было тишины)
+@dp.message()
+async def unknown_message(message: Message):
     await message.answer(
-        f"📊 **{t1_found}**: {t1_avg} гола → {itb1}\n"
-        f"🚀 **{t2_found}**: {t2_avg} гола → {itb2}"
+        "❓ Я не понял. Отправь две команды через дефис.\n"
+        "Пример: `Реал Мадрид - Барселона`"
     )
 
 async def health(request):
