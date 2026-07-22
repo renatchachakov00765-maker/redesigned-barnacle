@@ -1,4 +1,3 @@
-
 import os
 import sys
 import logging
@@ -17,15 +16,14 @@ logging.basicConfig(
     stream=sys.stdout
 )
 
-# === ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-SSTATS_KEY = os.getenv("SSTATS_KEY")
+SSTATS_KEY = os.getenv("SSTATSKEY")
 
 if not BOT_TOKEN:
     logging.critical("BOT_TOKEN не найден!")
     sys.exit(1)
 if not SSTATS_KEY:
-    logging.critical("SSTATS_KEY не найден!")
+    logging.critical("SSTATSKEY не найден!")
     sys.exit(1)
 
 API_BASE_URL = "https://sstats.net"
@@ -37,8 +35,6 @@ main_kb = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="⚽ Анализ ИТБ")]],
     resize_keyboard=True
 )
-
-# ==================== HANDLERS ====================
 
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
@@ -113,27 +109,19 @@ async def analyze_match(message: Message):
         f"🚀 **{t2_found}**: {t2_avg} гола → {itb2}"
     )
 
-# ==================== HEALTH + MAIN ====================
-
 async def health(request):
     return web.Response(text="OK", status=200)
-
-async def on_startup(app):
-    logging.info("Server started")
 
 async def main():
     app = web.Application()
     app.router.add_get("/", health)
-    app.on_startup.append(on_startup)
 
-    # === ЗАПУСК HEALTH-СЕРВЕРА ===
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", 8080)
     await site.start()
     logging.info("Health server on 0.0.0.0:8080")
 
-    # === ЗАПУСК POLLING ===
     logging.info("Start polling")
     await dp.start_polling(bot, skip_updates=True)
 
