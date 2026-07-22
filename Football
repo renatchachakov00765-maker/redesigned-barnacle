@@ -1,4 +1,3 @@
-
 import os
 import sys
 import logging
@@ -27,29 +26,26 @@ if not BOT_TOKEN:
     logging.critical("BOT_TOKEN not found!")
     sys.exit(1)
 
-# === RATE LIMITER: max 10 requests per minute ===
+# === RATE LIMITER ===
 _request_times = deque()
 MAX_RPM = 10
 
 def rate_limit():
     now = time.time()
-    # Remove requests older than 60 seconds
     while _request_times and now - _request_times[0] > 60:
         _request_times.popleft()
-
     if len(_request_times) >= MAX_RPM:
         sleep_time = 60 - (now - _request_times[0]) + 1
         logging.warning(f"Rate limit hit. Sleeping {sleep_time:.1f}s")
         time.sleep(max(sleep_time, 1))
-
     _request_times.append(time.time())
 
 # === SESSION ===
 session = requests.Session()
 session.headers.update({"Connection": "close"})
 
-# === TEST API CONNECTIVITY ===
-logging.info("=== TESTING API CONNECTIVITY ===")
+# === TEST API ===
+logging.info("=== TESTING API ===")
 
 test_urls = [
     ("api.sstats.net no key", "https://api.sstats.net/leagues", {}),
@@ -63,7 +59,7 @@ for name, url, kwargs in test_urls:
     except Exception as e:
         logging.error(f"TEST FAIL [{name}]: {type(e).__name__}: {e}")
 
-logging.info("=== END API TESTS ===")
+logging.info("=== END TESTS ===")
 
 API_BASE_URL = "https://api.sstats.net"
 
@@ -71,9 +67,9 @@ bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
 dp = Dispatcher()
 
 # === CACHE ===
-_team_cache = {}      # name -> (id, name)
-_matches_cache = {}   # team_id -> [(match, goals)]
-_cache_time = {}      # team_id -> timestamp
+_team_cache = {}
+_matches_cache = {}
+_cache_time = {}
 
 # === KEYBOARD ===
 main_kb = ReplyKeyboardMarkup(
@@ -84,24 +80,26 @@ main_kb = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-# === API SSTATS WITH RATE LIMIT + RETRY ===
+# === API WITH RATE LIMIT + RETRY + LOGGING ===
 def api_get(endpoint: str, params: dict = None, retries: int = 3):
     url = f"{API_BASE_URL}{endpoint}"
     p = params or {}
     if SSTATS_KEY:
         p["apikey"] = SSTATS_KEY
 
-    rate_limit()  # Wait if rate limit hit
+    rate_limit()
 
     for attempt in range(retries):
         try:
             response = session.get(url, params=p, timeout=15, headers={"Connection": "close"})
             response.raise_for_status()
-            return response.json()
+            data = response.json()
+            logging.info(f"API OK {endpoint}: status={response.status_code}, keys={list(data.keys()) if isinstance(data, dict) else 'list'}, count={len(data) if isinstance(data, list) else (len(data.get('data', [])) if isinstance(data, dict) else 'N/A')}")
+            return data
         except Exception as e:
             logging.error(f"API error {endpoint} attempt {attempt+1}/{retries}: {e}")
             if attempt < retries - 1:
-                time.sleep(2 * (attempt + 1))  # backoff: 2s, 4s, 6s
+                time.sleep(2 * (attempt + 1))
             else:
                 return None
 
@@ -170,15 +168,27 @@ def get_team_matches(team_id: int, limit: int = 10, is_home: bool = None):
 
 def get_today_fixtures(max_matches: int = 10):
     today = datetime.now().strftime("%Y-%m-%d")
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
 
-    data = api_get("/Games/list", {
-        "Date": today,
-        "Upcoming": "true",
-        "Limit": max_matches,
-    })
+    # Try multiple date approaches
+    approaches = [
+        ("Date=today", {"Date": today, "Upcoming": "true", "Limit": max_matches}),
+        ("From=yesterday To=tomorrow", {"From": yesterday, "To": tomorrow, "Upcoming": "true", "Limit": max_matches}),
+        ("No date just Upcoming", {"Upcoming": "true", "Limit": max_matches}),
+        ("Today=true", {"Today": "true", "Limit": max_matches}),
+    ]
 
-    if data and data.get("status") == "ok" and data.get("data"):
-        return data["data"]
+    for name, params in approaches:
+        logging.info(f"Trying fixtures approach: {name}")
+        data = api_get("/Games/list", params)
+        if data and data.get("status") == "ok" and data.get("data"):
+            matches = data["data"]
+            logging.info(f"Approach {name} returned {len(matches)} matches")
+            if len(matches) > 0:
+                return matches
+        else:
+            logging.info(f"Approach {name} returned empty or error")
 
     return []
 
@@ -222,7 +232,7 @@ def calculate_advanced_itb(team_id: int, is_home: bool):
 _scan_results = {}
 
 async def scan_matches(user_id: int):
-    fixtures = get_today_fixtures(max_matches=10)  # Limit to 10 matches
+    fixtures = get_today_fixtures(max_matches=10)
 
     if not fixtures:
         return None, "API returned no matches for today. Enter manually: Team1 - Team2"
