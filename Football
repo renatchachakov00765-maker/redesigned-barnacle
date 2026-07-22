@@ -228,7 +228,11 @@ async def scan_matches(user_id: int):
     return recommendations, None
 
 # === HANDLERS ===
-@dp.message(F.text.lower().in_("/start", "start", "начать", "старт"))
+START_CMDS = ["/start", "start", "nachat", "st"]
+SCAN_CMDS = ["skanirovat matshi dnya", "scan", "scan matches", "scan matches today"]
+RECS_CMDS = ["moi rekomendatsii", "my recommendations", "recommendations"]
+
+@dp.message(F.text.lower().in_(START_CMDS))
 async def cmd_start(message: Message):
     await message.answer(
         "Hello! I scan today matches and look for high ITB 0.5 probability.\n\n"
@@ -236,7 +240,7 @@ async def cmd_start(message: Message):
         reply_markup=main_kb
     )
 
-@dp.message(F.text.lower().in_("skanirovat matshi dnya", "scan", "scan matches", "scan matches today"))
+@dp.message(F.text.lower().in_(SCAN_CMDS))
 async def scan_handler(message: Message):
     user_id = message.from_user.id
     await message.answer("Scanning today matches... Wait 10-20 seconds.")
@@ -268,7 +272,7 @@ async def scan_handler(message: Message):
 
     await message.answer(text)
 
-@dp.message(F.text.lower().in_("moi rekomendatsii", "my recommendations", "recommendations"))
+@dp.message(F.text.lower().in_(RECS_CMDS))
 async def show_recommendations(message: Message):
     user_id = message.from_user.id
     recs = _scan_results.get(user_id, [])
