@@ -1,458 +1,147 @@
-import os
-import sys
-import logging
-import requests
-import asyncio
 import time
-from datetime import datetime, timedelta
-from collections import deque
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
-from aiogram.client.default import DefaultBotProperties
-from aiohttp import web
+import requests
+import telebot
+import threading
+from datetime import datetime
 
-sys.stdout.reconfigure(line_buffering=True)
+# === АВТОМАТИЧЕСКАЯ НАСТРОЙКА ТОКЕНОВ И КЛЮЧЕЙ ===
+TELEGRAM_TOKEN = "ВАШ_ТЕЛЕГРАМ_ТОКЕН"  # Вставьте ваш токен от @BotFather сюда
+SSTATS_API_KEY = "ВАШ_КЛЮЧ_SSTATS"       # Вставьте ваш API-ключ от SStats сюда
+BASE_URL = "https://sstats.net"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    stream=sys.stdout
-)
+bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# Настройка заголовков авторизации для API SStats
+headers = {
+    "Authorization": f"Bearer {SSTATS_API_KEY}",
+    "Accept": "application/json"
+}
 
-if not BOT_TOKEN:
-    logging.critical("BOT_TOKEN not found!")
-    sys.exit(1)
+def safe_float(value, default=0.0):
+    """Защита от болезней ботов: безопасная конвертация типов данных."""
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return default
 
-# === RATE LIMITER ===
-_request_times = deque()
-MAX_RPM = 8  # Чуть ниже лимита для безопасности
-
-def rate_limit():
-    now = time.time()
-    while _request_times and now - _request_times[0] > 60:
-        _request_times.popleft()
-    if len(_request_times) >= MAX_RPM:
-        sleep_time = 60 - (now - _request_times[0]) + 1
-        logging.warning(f"Rate limit hit. Sleeping {sleep_time:.1f}s")
-        time.sleep(max(sleep_time, 1))
-    _request_times.append(time.time())
-
-# === SESSION ===
-session = requests.Session()
-session.headers.update({
-    "Accept": "application/json",
-    "User-Agent": "SStatsBot/1.0"
-})
-
-# === TEST API ===
-logging.info("=== TESTING API ===")
-
-try:
-    r = session.get("https://api.sstats.net/leagues", timeout=10)
-    logging.info(f"TEST OK: status={r.status_code}, len={len(r.text)}")
-except Exception as e:
-    logging.error(f"TEST FAIL: {type(e).__name__}: {e}")
-
-logging.info("=== END TESTS ===")
-
-API_BASE_URL = "https://api.sstats.net"
-
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
-dp = Dispatcher()
-
-# === CACHE ===
-_team_cache = {}
-_matches_cache = {}
-_cache_time = {}
-_leagues_cache = None
-_leagues_cache_time = None
-
-# === KEYBOARD ===
-main_kb = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="Skanirovat matshi dnya")],
-        [KeyboardButton(text="Moi rekomendatsii")],
-    ],
-    resize_keyboard=True
-)
-
-# === API WITH RATE LIMIT + RETRY + LOGGING ===
-def api_get(endpoint: str, params: dict = None, retries: int = 3):
-    url = f"{API_BASE_URL}{endpoint}"
-    p = params or {}
-
-    rate_limit()
-
-    for attempt in range(retries):
-        try:
-            response = session.get(url, params=p, timeout=15)
-            response.raise_for_status()
+def get_team_stats_safe(team_id, side):
+    """Безопасный запрос к API с ограничением по времени и обработкой ошибок."""
+    try:
+        url = f"{BASE_URL}/teams/{team_id}/stats"
+        # Тайм-аут 10 секунд защищает от вечного зависания при сбое сети
+        response = requests.get(url, headers=headers, timeout=10)
+        
+        if response.status_code == 200:
             data = response.json()
+            if side == 'home':
+                return safe_float(data.get('home_goals_scored_avg'))
+            elif side == 'away':
+                return safe_float(data.get('away_goals_conceded_avg'))
+        return 0.0
+    except Exception as e:
+        print(f"Ошибочный ответ сети для команды {team_id}: {e}")
+        return 0.0
 
-            if isinstance(data, dict):
-                logging.info(f"API OK {endpoint}: status={response.status_code}, keys={list(data.keys())}, data_len={len(data.get('data', [])) if isinstance(data.get('data'), list) else 'N/A'}")
-            else:
-                logging.info(f"API OK {endpoint}: status={response.status_code}, type={type(data)}")
-
-            return data
-        except Exception as e:
-            logging.error(f"API error {endpoint} attempt {attempt+1}/{retries}: {e}")
-            if attempt < retries - 1:
-                time.sleep(2 * (attempt + 1))
-            else:
-                return None
-
-def get_leagues():
-    """Получить список лиг с кэшированием."""
-    global _leagues_cache, _leagues_cache_time
-    now = datetime.now()
-    if _leagues_cache and _leagues_cache_time and (now - _leagues_cache_time).seconds < 3600:
-        return _leagues_cache
-
-    data = api_get("/leagues")
-    if data and data.get("status") == "ok" and data.get("data"):
-        _leagues_cache = data["data"]
-        _leagues_cache_time = now
-        logging.info(f"Loaded {len(_leagues_cache)} leagues")
-        return _leagues_cache
-
-    logging.warning("Failed to load leagues")
-    return []
-
-def get_team_id(team_name: str):
-    key = team_name.lower().strip()
-    if key in _team_cache:
-        return _team_cache[key]
-
-    data = api_get("/teams/list", {"Name": team_name, "Limit": 10})
-    if data and data.get("status") == "ok" and data.get("data"):
-        teams = data["data"]
-        for t in teams:
-            if team_name.lower() in t.get("name", "").lower() or t.get("name", "").lower() in team_name.lower():
-                result = (t["id"], t["name"])
-                _team_cache[key] = result
-                return result
-        if teams:
-            result = (teams[0]["id"], teams[0]["name"])
-            _team_cache[key] = result
-            return result
-
-    return None, None
-
-def get_team_matches(team_id: int, limit: int = 10, is_home: bool = None):
-    now = datetime.now()
-    cache_key = f"{team_id}_{is_home}"
-    if cache_key in _cache_time and (now - _cache_time[cache_key]).seconds < 300:
-        return _matches_cache.get(cache_key, [])
-
-    params = {
-        "Team": team_id,
-        "Ended": "true",
-        "Limit": limit * 2,
-        "Order": -1,
-    }
-
-    data = api_get("/games/list", params)
-    if not data or data.get("status") != "ok" or not data.get("data"):
-        return []
-
-    matches = data["data"]
-    result = []
-    for m in matches:
-        home_id = m.get("homeTeam", {}).get("id")
-        away_id = m.get("awayTeam", {}).get("id")
-
-        if home_id == team_id:
-            goals_scored = int(m.get("homeResult", 0) or 0)
-            match_is_home = True
-        elif away_id == team_id:
-            goals_scored = int(m.get("awayResult", 0) or 0)
-            match_is_home = False
+def process_predictions_async(chat_id):
+    """Асинхронный движок анализа матчей, работающий в фоновом режиме."""
+    today_date = datetime.now().strftime("%Y-%m-%d")
+    matches_url = f"{BASE_URL}/matches"
+    params = {"date": today_date}
+    
+    try:
+        bot.send_message(chat_id, "🔍 Подключаюсь к SStats API... Начинаю анализ матчей по новым критериям.")
+        response = requests.get(matches_url, headers=headers, params=params, timeout=10)
+        
+        if response.status_code != 200:
+            bot.send_message(chat_id, "⚠️ Ошибка авторизации. Проверьте правильность SSTATS_API_KEY в коде.")
+            return
+            
+        matches = response.json().get('data', [])
+        if not matches:
+            bot.send_message(chat_id, "📅 В базе SStats на сегодня матчей для анализа не обнаружено.")
+            return
+            
+        found_signals = 0
+        
+        for match in matches:
+            home_name = match.get('home_team_name', 'Хозяева')
+            away_name = match.get('away_team_name', 'Гости')
+            league = match.get('league_name', 'Лига')
+            
+            home_id = match.get('home_team_id')
+            away_id = match.get('away_team_id')
+            
+            # Извлекаем рейтинги Глико-2
+            home_glicko = safe_float(match.get('home_glicko'), 1500.0)
+            away_glicko = safe_float(match.get('away_glicko'), 1500.0)
+            
+            # КРИТЕРИЙ 1: Сниженный порог разницы рейтинга Глико (от 100 пунктов)
+            if (home_glicko - away_glicko) < 100:
+                continue
+                
+            # ОЗДОРОВЛЕНИЕ БОТА: Обязательная пауза перед запросом, чтобы не спамить эндпоинты
+            time.sleep(1.5)
+            
+            # Запрашиваем точечную статистику команд
+            home_goals_avg = get_team_stats_safe(home_id, 'home')
+            away_conceded_avg = get_team_stats_safe(away_id, 'away')
+            
+            # КРИТЕРИИ 2 и 3: Порог результативности строго больше 1.3 голов
+            if home_goals_avg > 1.3 and away_conceded_avg > 1.3:
+                found_signals += 1
+                
+                # Формируем динамический индекс математической уверенности
+                score_weight = (home_goals_avg + away_conceded_avg) * 12
+                glicko_weight = (home_glicko - away_glicko) / 5
+                probability = min(99, int(score_weight + glicko_weight))
+                
+                message_text = (
+                    f"⭐ **СИГНАЛ: ИТБ1 (0.5)**\n"
+                    f"🏆 Лига: {league}\n"
+                    f"⚔️ Матч: {home_name} — {away_name}\n"
+                    f"📈 Рейтинг Glicko-2: {int(home_glicko)} vs {int(away_glicko)} (Разница: +{int(home_glicko-away_glicko)})\n"
+                    f"⚽️ Ср. голов дома (Хозяева): {home_goals_avg}\n"
+                    f"🛡 Ср. пропущено в гостях (Гости): {away_conceded_avg}\n\n"
+                    f"🎯 **Вероятность захода: {probability}%**"
+                )
+                
+                bot.send_message(chat_id, message_text, parse_mode="Markdown")
+                
+        if found_signals == 0:
+            bot.send_message(chat_id, "ℹ️ Сканирование завершено. Матчей под критерии (Глико > 100, голы > 1.3) сегодня нет.")
         else:
-            continue
+            bot.send_message(chat_id, f"✅ Анализ окончен. Всего найдено подходящих матчей: {found_signals}")
+            
+    except Exception as general_error:
+        bot.send_message(chat_id, f"❌ Критическая системная ошибка в цикле: {general_error}")
 
-        if is_home is not None and match_is_home != is_home:
-            continue
+# === ИНТЕРФЕЙС И ОБРАБОТЧИКИ ТЕЛЕГРАМ ===
 
-        result.append((m, goals_scored))
-        if len(result) >= limit:
-            break
-
-    _matches_cache[cache_key] = result
-    _cache_time[cache_key] = now
-    return result
-
-def get_today_fixtures(max_matches: int = 10):
-    """Получить матчи на сегодня через /games/list?LeagueId=&Year="""
-    today = datetime.now().strftime("%Y-%m-%d")
-    logging.info(f"=== get_today_fixtures for {today} ===")
-
-    leagues = get_leagues()
-    if not leagues:
-        logging.warning("No leagues loaded")
-        return []
-
-    all_matches = []
-    current_year = datetime.now().year
-    target_leagues = leagues[:20]  # Первые 20 лиг для скорости
-
-    logging.info(f"Querying {len(target_leagues)} leagues for year {current_year}")
-
-    for league in target_leagues:
-        league_id = league.get("id")
-        league_name = league.get("name", "?")
-        if not league_id:
-            continue
-
-        params = {
-            "LeagueId": league_id,
-            "Year": current_year,
-            "Limit": 30
-        }
-
-        data = api_get("/games/list", params)
-
-        if data and data.get("status") == "ok":
-            matches = data.get("data", [])
-            if matches:
-                logging.info(f"League {league_id} ({league_name}): {len(matches)} matches")
-                if not all_matches and matches:
-                    logging.info(f"First match structure: {matches[0]}")
-                all_matches.extend(matches)
-
-    logging.info(f"Total matches loaded: {len(all_matches)}")
-
-    # Фильтруем по сегодняшней дате
-    today_matches = []
-    for m in all_matches:
-        match_date = m.get("date") or m.get("matchDate") or m.get("Date") or m.get("startDate")
-        if match_date:
-            match_date_str = str(match_date)[:10]
-            if today == match_date_str:
-                today_matches.append(m)
-
-    logging.info(f"Today matches ({today}): {len(today_matches)}")
-
-    today_matches.sort(key=lambda x: x.get("date", "") or x.get("matchDate", ""))
-    return today_matches[:max_matches]
-
-# === PROBABILITY CALC ===
-def poisson_probability(lambda_val: float, target: int = 1):
-    import math
-    if target == 1:
-        return round((1 - math.exp(-lambda_val)) * 100, 1)
-    return 0
-
-def calculate_advanced_itb(team_id: int, is_home: bool):
-    matches = get_team_matches(team_id, limit=10, is_home=is_home)
-    if not matches:
-        return None, "No data"
-
-    if len(matches) < 3:
-        return None, f"Few matches ({len(matches)})"
-
-    goals_list = [g for _, g in matches]
-    lambda_base = sum(goals_list) / len(goals_list)
-
-    weights = [0.15, 0.25, 0.40]
-    recent_goals = goals_list[:3]
-    weighted_avg = sum(g * w for g, w in zip(recent_goals, weights[:len(recent_goals)])) / sum(weights[:len(recent_goals)])
-
-    lambda_final = lambda_base * 0.6 + weighted_avg * 0.4
-    prob = poisson_probability(lambda_final, 1)
-
-    if lambda_final > 1.5 and prob < 60:
-        prob = min(75, prob + 10)
-
-    return {
-        "probability": prob,
-        "lambda": round(lambda_final, 2),
-        "avg_goals": round(lambda_base, 2),
-        "matches_count": len(matches),
-        "confidence": "High" if len(matches) >= 5 else "Medium",
-    }, None
-
-# === SCANNER ===
-_scan_results = {}
-
-async def scan_matches(user_id: int):
-    logging.info(f"=== scan_matches for user {user_id} ===")
-    fixtures = get_today_fixtures(max_matches=10)
-
-    if not fixtures:
-        logging.info("No fixtures found")
-        return None, "No matches for today. Enter manually: Team1 - Team2"
-
-    recommendations = []
-
-    for fixture in fixtures:
-        home_team = fixture.get("homeTeam", {})
-        away_team = fixture.get("awayTeam", {})
-        home_name = home_team.get("name", "")
-        away_name = away_team.get("name", "")
-        match_time = fixture.get("date", "??")
-
-        if not home_name or not away_name:
-            continue
-
-        home_id, _ = get_team_id(home_name)
-        away_id, _ = get_team_id(away_name)
-
-        if not home_id or not away_id:
-            logging.warning(f"IDs not found: {home_name} vs {away_name}")
-            continue
-
-        home_stats, _ = calculate_advanced_itb(home_id, is_home=True)
-        away_stats, _ = calculate_advanced_itb(away_id, is_home=False)
-
-        if home_stats and home_stats["probability"] >= 65:
-            recommendations.append({
-                "match": f"{home_name} - {away_name}",
-                "time": match_time,
-                "team": home_name,
-                "side": "home",
-                "probability": home_stats["probability"],
-                "avg_goals": home_stats["avg_goals"],
-                "confidence": home_stats["confidence"],
-            })
-
-        if away_stats and away_stats["probability"] >= 65:
-            recommendations.append({
-                "match": f"{home_name} - {away_name}",
-                "time": match_time,
-                "team": away_name,
-                "side": "away",
-                "probability": away_stats["probability"],
-                "avg_goals": away_stats["avg_goals"],
-                "confidence": away_stats["confidence"],
-            })
-
-    recommendations.sort(key=lambda x: x["probability"], reverse=True)
-    _scan_results[user_id] = recommendations
-    logging.info(f"Scan done: {len(recommendations)} recommendations")
-
-    return recommendations, None
-
-# === HANDLERS ===
-START_CMDS = ["/start", "start", "nachat", "st"]
-SCAN_CMDS = ["skanirovat matshi dnya", "scan", "scan matches", "scan matches today"]
-RECS_CMDS = ["moi rekomendatsii", "my recommendations", "recommendations"]
-
-@dp.message(F.text.lower().in_(START_CMDS))
-async def cmd_start(message: Message):
-    await message.answer(
-        "Hello! I scan today matches and look for high ITB 0.5 probability.\n\n"
-        "Press button below to scan or enter: Team1 - Team2",
-        reply_markup=main_kb
+@bot.message_handler(commands=['start'])
+def welcome_user(message):
+    bot.reply_to(
+        message,
+        "🤖 Бот-сканер SStats готов к работе.\n"
+        "Нажмите /predict для запуска поиска матчей на **ИТБ1 (0.5)**.\n"
+        "Текущие фильтры: Разница Glicko > 100, Ср. голы > 1.3.",
+        parse_mode="Markdown"
     )
 
-@dp.message(F.text.lower().in_(SCAN_CMDS))
-async def scan_handler(message: Message):
-    user_id = message.from_user.id
-    logging.info(f"SCAN handler by user {user_id}")
-    await message.answer("Scanning today matches... Wait 10-20 seconds.")
+@bot.message_handler(commands=['predict'])
+def run_prediction_thread(message):
+    # Запуск логики в threading.Thread избавляет бота от зависаний при обработке длинных очередей
+    threading.Thread(target=process_predictions_async, args=(message.chat.id,)).start()
 
-    try:
-        recommendations, error = await scan_matches(user_id)
-    except Exception as e:
-        logging.exception("scan_matches crashed")
-        await message.answer(f"Scan error: {e}")
-        return
+if __name__ == '__main__':
+    print("Бот успешно инициализирован и запущен в режиме Long Polling...")
+    
+    # Бесконечный цикл с защитой от разрыва соединения с серверами Telegram
+    while True:
+        try:
+            bot.polling(none_stop=True, interval=0, timeout=20)
+        except Exception as telegram_error:
+            print(f"Сбой связи с Telegram: {telegram_error}. Перезапуск через 5 секунд...")
+            time.sleep(5)
 
-    if error:
-        await message.answer(f"Warning: {error}")
-        return
-
-    if not recommendations:
-        await message.answer(
-            "No matches today with ITB 0.5 probability >= 65%.\n"
-            "Try tomorrow or enter manually: Team1 - Team2"
-        )
-        return
-
-    text = f"Found {len(recommendations)} recommendations:\n\n"
-    for i, rec in enumerate(recommendations[:10], 1):
-        emoji = "green" if rec["probability"] >= 75 else "yellow"
-        text += (
-            f"{emoji} **{rec['match']}** ({rec['time']})\n"
-            f"   -> ITB 0.5 **{rec['team']}** ({rec['side']})\n"
-            f"   Probability: **{rec['probability']}%**\n"
-            f"   Avg goals: {rec['avg_goals']}\n"
-            f"   Confidence: {rec['confidence']}\n\n"
-        )
-    await message.answer(text)
-
-@dp.message(F.text.lower().in_(RECS_CMDS))
-async def show_recommendations(message: Message):
-    user_id = message.from_user.id
-    recs = _scan_results.get(user_id, [])
-    if not recs:
-        await message.answer("First press Scan button")
-        return
-    text = f"Your recommendations ({len(recs)}):\n\n"
-    for i, rec in enumerate(recs[:10], 1):
-        emoji = "green" if rec["probability"] >= 75 else "yellow"
-        text += f"{emoji} **{rec['match']}** -> ITB 0.5 {rec['team']} - **{rec['probability']}%**\n"
-    await message.answer(text)
-
-@dp.message(F.text.contains("-"))
-async def manual_analyze(message: Message):
-    try:
-        teams = message.text.split("-")
-        if len(teams) != 2:
-            await message.answer("Format: Team1 - Team2")
-            return
-        t1_name, t2_name = teams[0].strip(), teams[1].strip()
-        await message.answer(f"Analyzing `{t1_name}` vs `{t2_name}`...")
-        t1_id, t1_found = get_team_id(t1_name)
-        t2_id, t2_found = get_team_id(t2_name)
-        if not t1_id or not t2_id:
-            await message.answer("One or both teams not found")
-            return
-        home_stats, _ = calculate_advanced_itb(t1_id, is_home=True)
-        away_stats, _ = calculate_advanced_itb(t2_id, is_home=False)
-        text = f"**{t1_found} vs {t2_found}**\n\n"
-        if home_stats:
-            emoji = "green" if home_stats["probability"] >= 65 else "yellow" if home_stats["probability"] >= 50 else "red"
-            text += f"{emoji} **ITB 0.5 {t1_found} (home)**\n   Probability: **{home_stats['probability']}%**\n   Lambda: {home_stats['lambda']}\n   Avg goals: {home_stats['avg_goals']}\n\n"
-        if away_stats:
-            emoji = "green" if away_stats["probability"] >= 65 else "yellow" if away_stats["probability"] >= 50 else "red"
-            text += f"{emoji} **ITB 0.5 {t2_found} (away)**\n   Probability: **{away_stats['probability']}%**\n   Lambda: {away_stats['lambda']}\n   Avg goals: {away_stats['avg_goals']}\n\n"
-        best = None
-        if home_stats and away_stats:
-            if home_stats["probability"] >= away_stats["probability"] and home_stats["probability"] >= 65:
-                best = (t1_found, "home", home_stats["probability"])
-            elif away_stats["probability"] >= 65:
-                best = (t2_found, "away", away_stats["probability"])
-        if best:
-            text += f"Recommendation: ITB 0.5 **{best[0]}** ({best[1]}) - {best[2]}%"
-        else:
-            text += "No confident recommendations (probability < 65%)"
-        await message.answer(text)
-    except Exception as e:
-        logging.exception("Manual analysis error")
-        await message.answer("Analysis error. Try later.")
-
-@dp.message()
-async def unknown(message: Message):
-    await message.answer("I did not understand.\n\nPress Scan button or enter: Team1 - Team2")
-
-# === SERVER ===
-async def health(request):
-    return web.Response(text="OK", status=200)
-
-async def main():
-    app = web.Application()
-    app.router.add_get("/", health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", 8080)
-    await site.start()
-    logging.info("Health server on 0.0.0.0:8080")
-    logging.info("Start polling")
-    await dp.start_polling(bot, skip_updates=True)
-
-if __name__ == "__main__":
-    asyncio.run(main())
