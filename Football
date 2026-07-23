@@ -1,4 +1,3 @@
-
 import os
 import sys
 import logging
@@ -21,17 +20,14 @@ logging.basicConfig(
 )
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-SSTATS_KEY = os.getenv("SSTATSKEY")
 
 if not BOT_TOKEN:
     logging.critical("BOT_TOKEN not found!")
     sys.exit(1)
 
-logging.info(f"SSTATS_KEY present: {bool(SSTATS_KEY)}")
-
 # === RATE LIMITER ===
 _request_times = deque()
-MAX_RPM = 10
+MAX_RPM = 8  # Чуть ниже лимита для безопасности
 
 def rate_limit():
     now = time.time()
@@ -46,7 +42,6 @@ def rate_limit():
 # === SESSION ===
 session = requests.Session()
 session.headers.update({
-    "Connection": "close",
     "Accept": "application/json",
     "User-Agent": "SStatsBot/1.0"
 })
@@ -54,16 +49,11 @@ session.headers.update({
 # === TEST API ===
 logging.info("=== TESTING API ===")
 
-test_urls = [
-    ("api.sstats.net no key", "https://api.sstats.net/leagues", {}),
-]
-
-for name, url, kwargs in test_urls:
-    try:
-        r = session.get(url, timeout=10, **kwargs)
-        logging.info(f"TEST OK [{name}]: status={r.status_code}, len={len(r.text)}")
-    except Exception as e:
-        logging.error(f"TEST FAIL [{name}]: {type(e).__name__}: {e}")
+try:
+    r = session.get("https://api.sstats.net/leagues", timeout=10)
+    logging.info(f"TEST OK: status={r.status_code}, len={len(r.text)}")
+except Exception as e:
+    logging.error(f"TEST FAIL: {type(e).__name__}: {e}")
 
 logging.info("=== END TESTS ===")
 
@@ -93,50 +83,20 @@ def api_get(endpoint: str, params: dict = None, retries: int = 3):
     url = f"{API_BASE_URL}{endpoint}"
     p = params or {}
 
-    headers = {
-        "Connection": "close",
-        "Accept": "application/json",
-        "User-Agent": "SStatsBot/1.0"
-    }
-    if SSTATS_KEY:
-        headers["apikey"] = SSTATS_KEY
-
     rate_limit()
 
     for attempt in range(retries):
         try:
-            response = session.get(url, params=p, timeout=15, headers=headers)
+            response = session.get(url, params=p, timeout=15)
             response.raise_for_status()
             data = response.json()
 
-            # ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ
             if isinstance(data, dict):
-                logging.info(f"API OK {endpoint}: status={response.status_code}, keys={list(data.keys())}, data_type={type(data.get('data'))}, data_len={len(data.get('data', [])) if isinstance(data.get('data'), list) else 'N/A'}")
+                logging.info(f"API OK {endpoint}: status={response.status_code}, keys={list(data.keys())}, data_len={len(data.get('data', [])) if isinstance(data.get('data'), list) else 'N/A'}")
             else:
-                logging.info(f"API OK {endpoint}: status={response.status_code}, type={type(data)}, len={len(data) if hasattr(data, '__len__') else 'N/A'}")
+                logging.info(f"API OK {endpoint}: status={response.status_code}, type={type(data)}")
 
             return data
-        except requests.exceptions.ConnectionError as e:
-            logging.error(f"ConnectionError {endpoint} attempt {attempt+1}/{retries}: {e}")
-            if attempt == 0 and SSTATS_KEY:
-                logging.info("Retrying without apikey in headers...")
-                try:
-                    fallback_headers = {
-                        "Connection": "close",
-                        "Accept": "application/json",
-                        "User-Agent": "SStatsBot/1.0"
-                    }
-                    response = session.get(url, params=p, timeout=15, headers=fallback_headers)
-                    response.raise_for_status()
-                    data = response.json()
-                    logging.info(f"API OK {endpoint} (fallback no key): status={response.status_code}")
-                    return data
-                except Exception as e2:
-                    logging.error(f"Fallback also failed: {e2}")
-            if attempt < retries - 1:
-                time.sleep(2 * (attempt + 1))
-            else:
-                return None
         except Exception as e:
             logging.error(f"API error {endpoint} attempt {attempt+1}/{retries}: {e}")
             if attempt < retries - 1:
@@ -149,44 +109,17 @@ def get_leagues():
     global _leagues_cache, _leagues_cache_time
     now = datetime.now()
     if _leagues_cache and _leagues_cache_time and (now - _leagues_cache_time).seconds < 3600:
-        logging.info(f"Using cached leagues: {len(_leagues_cache)} leagues")
         return _leagues_cache
 
-    logging.info("Fetching leagues from API...")
     data = api_get("/leagues")
+    if data and data.get("status") == "ok" and data.get("data"):
+        _leagues_cache = data["data"]
+        _leagues_cache_time = now
+        logging.info(f"Loaded {len(_leagues_cache)} leagues")
+        return _leagues_cache
 
-    if not data:
-        logging.error("api_get(/leagues) returned None")
-        return []
-
-    if not isinstance(data, dict):
-        logging.error(f"api_get(/leagues) returned non-dict: {type(data)}")
-        return []
-
-    logging.info(f"Leagues response keys: {list(data.keys())}")
-
-    if data.get("status") != "ok":
-        logging.error(f"Leagues API status != ok: {data.get('status')}")
-        return []
-
-    leagues_data = data.get("data")
-    if not leagues_data:
-        logging.warning("Leagues data is empty or None")
-        return []
-
-    if not isinstance(leagues_data, list):
-        logging.error(f"Leagues data is not a list: {type(leagues_data)}")
-        return []
-
-    _leagues_cache = leagues_data
-    _leagues_cache_time = now
-    logging.info(f"Loaded {len(_leagues_cache)} leagues")
-
-    # Логируем первые 3 лиги для проверки структуры
-    for i, league in enumerate(_leagues_cache[:3]):
-        logging.info(f"League sample {i}: {league}")
-
-    return _leagues_cache
+    logging.warning("Failed to load leagues")
+    return []
 
 def get_team_id(team_name: str):
     key = team_name.lower().strip()
@@ -254,27 +187,23 @@ def get_team_matches(team_id: int, limit: int = 10, is_home: bool = None):
 def get_today_fixtures(max_matches: int = 10):
     """Получить матчи на сегодня через /games/list?LeagueId=&Year="""
     today = datetime.now().strftime("%Y-%m-%d")
-    logging.info(f"=== get_today_fixtures called for {today} ===")
+    logging.info(f"=== get_today_fixtures for {today} ===")
 
-    # Получаем список лиг
     leagues = get_leagues()
     if not leagues:
-        logging.warning("No leagues loaded — returning empty")
+        logging.warning("No leagues loaded")
         return []
 
     all_matches = []
-    current_year = datetime.now().year  # 2026
-    logging.info(f"Current year for API: {current_year}")
+    current_year = datetime.now().year
+    target_leagues = leagues[:20]  # Первые 20 лиг для скорости
 
-    # Запрашиваем матчи для каждой лиги
-    target_leagues = leagues[:25]  # Первые 25 лиг
-    logging.info(f"Will query {len(target_leagues)} leagues")
+    logging.info(f"Querying {len(target_leagues)} leagues for year {current_year}")
 
     for league in target_leagues:
         league_id = league.get("id")
         league_name = league.get("name", "?")
         if not league_id:
-            logging.warning(f"League {league_name} has no id, skipping")
             continue
 
         params = {
@@ -283,28 +212,17 @@ def get_today_fixtures(max_matches: int = 10):
             "Limit": 30
         }
 
-        logging.info(f"Querying league {league_id} ({league_name})...")
         data = api_get("/games/list", params)
 
-        if not data:
-            logging.warning(f"No data for league {league_id}")
-            continue
+        if data and data.get("status") == "ok":
+            matches = data.get("data", [])
+            if matches:
+                logging.info(f"League {league_id} ({league_name}): {len(matches)} matches")
+                if not all_matches and matches:
+                    logging.info(f"First match structure: {matches[0]}")
+                all_matches.extend(matches)
 
-        if data.get("status") != "ok":
-            logging.warning(f"Status != ok for league {league_id}: {data.get('status')}")
-            continue
-
-        matches = data.get("data", [])
-        if matches:
-            logging.info(f"League {league_id} ({league_name}): {len(matches)} matches loaded")
-            # Логируем первый матч для проверки структуры
-            if len(all_matches) == 0 and len(matches) > 0:
-                logging.info(f"First match sample: {matches[0]}")
-            all_matches.extend(matches)
-        else:
-            logging.info(f"League {league_id} ({league_name}): 0 matches")
-
-    logging.info(f"Total matches loaded across all leagues: {len(all_matches)}")
+    logging.info(f"Total matches loaded: {len(all_matches)}")
 
     # Фильтруем по сегодняшней дате
     today_matches = []
@@ -315,11 +233,9 @@ def get_today_fixtures(max_matches: int = 10):
             if today == match_date_str:
                 today_matches.append(m)
 
-    logging.info(f"Total matches for {today}: {len(today_matches)}")
+    logging.info(f"Today matches ({today}): {len(today_matches)}")
 
-    # Сортируем по времени
     today_matches.sort(key=lambda x: x.get("date", "") or x.get("matchDate", ""))
-
     return today_matches[:max_matches]
 
 # === PROBABILITY CALC ===
@@ -362,12 +278,12 @@ def calculate_advanced_itb(team_id: int, is_home: bool):
 _scan_results = {}
 
 async def scan_matches(user_id: int):
-    logging.info(f"=== scan_matches called for user {user_id} ===")
+    logging.info(f"=== scan_matches for user {user_id} ===")
     fixtures = get_today_fixtures(max_matches=10)
 
     if not fixtures:
         logging.info("No fixtures found")
-        return None, "API returned no matches for today. Enter manually: Team1 - Team2"
+        return None, "No matches for today. Enter manually: Team1 - Team2"
 
     recommendations = []
 
@@ -379,14 +295,13 @@ async def scan_matches(user_id: int):
         match_time = fixture.get("date", "??")
 
         if not home_name or not away_name:
-            logging.warning(f"Fixture missing team names: {fixture}")
             continue
 
         home_id, _ = get_team_id(home_name)
         away_id, _ = get_team_id(away_name)
 
         if not home_id or not away_id:
-            logging.warning(f"Could not resolve IDs: {home_name} vs {away_name}")
+            logging.warning(f"IDs not found: {home_name} vs {away_name}")
             continue
 
         home_stats, _ = calculate_advanced_itb(home_id, is_home=True)
@@ -416,7 +331,7 @@ async def scan_matches(user_id: int):
 
     recommendations.sort(key=lambda x: x["probability"], reverse=True)
     _scan_results[user_id] = recommendations
-    logging.info(f"Scan complete: {len(recommendations)} recommendations")
+    logging.info(f"Scan done: {len(recommendations)} recommendations")
 
     return recommendations, None
 
@@ -436,7 +351,7 @@ async def cmd_start(message: Message):
 @dp.message(F.text.lower().in_(SCAN_CMDS))
 async def scan_handler(message: Message):
     user_id = message.from_user.id
-    logging.info(f"SCAN handler called by user {user_id}")
+    logging.info(f"SCAN handler by user {user_id}")
     await message.answer("Scanning today matches... Wait 10-20 seconds.")
 
     try:
@@ -458,7 +373,6 @@ async def scan_handler(message: Message):
         return
 
     text = f"Found {len(recommendations)} recommendations:\n\n"
-
     for i, rec in enumerate(recommendations[:10], 1):
         emoji = "green" if rec["probability"] >= 75 else "yellow"
         text += (
@@ -468,23 +382,19 @@ async def scan_handler(message: Message):
             f"   Avg goals: {rec['avg_goals']}\n"
             f"   Confidence: {rec['confidence']}\n\n"
         )
-
     await message.answer(text)
 
 @dp.message(F.text.lower().in_(RECS_CMDS))
 async def show_recommendations(message: Message):
     user_id = message.from_user.id
     recs = _scan_results.get(user_id, [])
-
     if not recs:
         await message.answer("First press Scan button")
         return
-
     text = f"Your recommendations ({len(recs)}):\n\n"
     for i, rec in enumerate(recs[:10], 1):
         emoji = "green" if rec["probability"] >= 75 else "yellow"
         text += f"{emoji} **{rec['match']}** -> ITB 0.5 {rec['team']} - **{rec['probability']}%**\n"
-
     await message.answer(text)
 
 @dp.message(F.text.contains("-"))
@@ -494,64 +404,40 @@ async def manual_analyze(message: Message):
         if len(teams) != 2:
             await message.answer("Format: Team1 - Team2")
             return
-
         t1_name, t2_name = teams[0].strip(), teams[1].strip()
         await message.answer(f"Analyzing `{t1_name}` vs `{t2_name}`...")
-
         t1_id, t1_found = get_team_id(t1_name)
         t2_id, t2_found = get_team_id(t2_name)
-
         if not t1_id or not t2_id:
             await message.answer("One or both teams not found")
             return
-
         home_stats, _ = calculate_advanced_itb(t1_id, is_home=True)
         away_stats, _ = calculate_advanced_itb(t2_id, is_home=False)
-
         text = f"**{t1_found} vs {t2_found}**\n\n"
-
         if home_stats:
             emoji = "green" if home_stats["probability"] >= 65 else "yellow" if home_stats["probability"] >= 50 else "red"
-            text += (
-                f"{emoji} **ITB 0.5 {t1_found} (home)**\n"
-                f"   Probability: **{home_stats['probability']}%**\n"
-                f"   Lambda: {home_stats['lambda']}\n"
-                f"   Avg goals: {home_stats['avg_goals']}\n\n"
-            )
-
+            text += f"{emoji} **ITB 0.5 {t1_found} (home)**\n   Probability: **{home_stats['probability']}%**\n   Lambda: {home_stats['lambda']}\n   Avg goals: {home_stats['avg_goals']}\n\n"
         if away_stats:
             emoji = "green" if away_stats["probability"] >= 65 else "yellow" if away_stats["probability"] >= 50 else "red"
-            text += (
-                f"{emoji} **ITB 0.5 {t2_found} (away)**\n"
-                f"   Probability: **{away_stats['probability']}%**\n"
-                f"   Lambda: {away_stats['lambda']}\n"
-                f"   Avg goals: {away_stats['avg_goals']}\n\n"
-            )
-
+            text += f"{emoji} **ITB 0.5 {t2_found} (away)**\n   Probability: **{away_stats['probability']}%**\n   Lambda: {away_stats['lambda']}\n   Avg goals: {away_stats['avg_goals']}\n\n"
         best = None
         if home_stats and away_stats:
             if home_stats["probability"] >= away_stats["probability"] and home_stats["probability"] >= 65:
                 best = (t1_found, "home", home_stats["probability"])
             elif away_stats["probability"] >= 65:
                 best = (t2_found, "away", away_stats["probability"])
-
         if best:
             text += f"Recommendation: ITB 0.5 **{best[0]}** ({best[1]}) - {best[2]}%"
         else:
             text += "No confident recommendations (probability < 65%)"
-
         await message.answer(text)
-
     except Exception as e:
         logging.exception("Manual analysis error")
         await message.answer("Analysis error. Try later.")
 
 @dp.message()
 async def unknown(message: Message):
-    await message.answer(
-        "I did not understand.\n\n"
-        "Press Scan button or enter: Team1 - Team2"
-    )
+    await message.answer("I did not understand.\n\nPress Scan button or enter: Team1 - Team2")
 
 # === SERVER ===
 async def health(request):
@@ -565,7 +451,6 @@ async def main():
     site = web.TCPSite(runner, "0.0.0.0", 8080)
     await site.start()
     logging.info("Health server on 0.0.0.0:8080")
-
     logging.info("Start polling")
     await dp.start_polling(bot, skip_updates=True)
 
