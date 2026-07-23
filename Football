@@ -1,3 +1,4 @@
+
 import time
 import requests
 import telebot
@@ -30,11 +31,18 @@ def get_team_stats_safe(team_id, side):
     """Безопасный запрос к API с ограничением по времени и обработкой ошибок."""
     try:
         url = f"{BASE_URL}/teams/{team_id}/stats"
-        # Тайм-аут 10 секунд защищает от вечного зависания при сбое сети
+        # Тайм-аут 10 секунд защищает от вечного зависания при сбое сети sstats
         response = requests.get(url, headers=headers, timeout=10)
         
         if response.status_code == 200:
-            data = response.json()
+            response_data = response.json()
+            
+            # Регистронезависимая проверка статуса внутри запроса команды
+            status = str(response_data.get("status", "")).lower()
+            if status != "ok":
+                return 0.0
+                
+            data = response_data.get('data', {}) if 'data' in response_data else response_data
             if side == 'home':
                 return safe_float(data.get('home_goals_scored_avg'))
             elif side == 'away':
@@ -51,14 +59,22 @@ def process_predictions_async(chat_id):
     params = {"date": today_date}
     
     try:
-        bot.send_message(chat_id, "🔍 Подключаюсь к SStats API... Начинаю анализ матчей по новым критериям.")
+        bot.send_message(chat_id, "🔍 Подключаюсь к SStats API... Начинаю анализ матчей.")
         response = requests.get(matches_url, headers=headers, params=params, timeout=10)
         
         if response.status_code != 200:
-            bot.send_message(chat_id, "⚠️ Ошибка авторизации. Проверьте правильность SSTATS_API_KEY в коде.")
+            bot.send_message(chat_id, "⚠️ Ошибка связи с API SStats. Проверьте правильность SSTATS_API_KEY.")
             return
             
-        matches = response.json().get('data', [])
+        response_data = response.json()
+        
+        # ИСПРАВЛЕНИЕ: Регистронезависимая проверка статуса ответа API ("ok", "OK", "Ok")
+        status = str(response_data.get("status", "")).lower()
+        if status != "ok":
+            bot.send_message(chat_id, f"⚠️ API вернул статус ошибки: {response_data.get('status')}")
+            return
+            
+        matches = response_data.get('data', [])
         if not matches:
             bot.send_message(chat_id, "📅 В базе SStats на сегодня матчей для анализа не обнаружено.")
             return
@@ -77,11 +93,11 @@ def process_predictions_async(chat_id):
             home_glicko = safe_float(match.get('home_glicko'), 1500.0)
             away_glicko = safe_float(match.get('away_glicko'), 1500.0)
             
-            # КРИТЕРИЙ 1: Сниженный порог разницы рейтинга Глико (от 100 пунктов)
+            # КРИТЕРИЙ 1: Порог разницы рейтинга Глико (от 100 пунктов)
             if (home_glicko - away_glicko) < 100:
                 continue
                 
-            # ОЗДОРОВЛЕНИЕ БОТА: Обязательная пауза перед запросом, чтобы не спамить эндпоинты
+            # ОЗДОРОВЛЕНИЕ БОТА: Обязательная пауза перед запросом, чтобы не спамить эндпоинты sstats
             time.sleep(1.5)
             
             # Запрашиваем точечную статистику команд
@@ -123,9 +139,9 @@ def process_predictions_async(chat_id):
 def welcome_user(message):
     bot.reply_to(
         message,
-        "🤖 Бот-сканер SStats готов к работе.\n"
+        "🤖 Исправленный бот-сканер SStats готов к работе.\n"
         "Нажмите /predict для запуска поиска матчей на **ИТБ1 (0.5)**.\n"
-        "Текущие фильтры: Разница Glicko > 100, Ср. голы > 1.3.",
+        "Текущие фильтры: Разница Glicko > 100, Ср. голы > 1.3, Регистронезависимость активна.",
         parse_mode="Markdown"
     )
 
