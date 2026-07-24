@@ -1,163 +1,319 @@
+#!/usr/bin/env python3
+"""
+sstats_fetcher.py
 
+Собирает "сегодняшние" матчи из SStats API (/games/list?Today=true).
+Сохраняет результат в JSON и CSV. Опционально подгружает /games/glicko/{id}.
+
+Настройки через переменные окружения:
+- SSTATS_API_KEY  (необязательно)
+- SSTATS_BASE_URL (по умолчанию https://api.sstats.net)
+- SSTATS_TIMEZONE (по умолчанию 3)
+
+Пример:
+    python sstats_fetcher.py --out-prefix today_matches --with-glicko
+"""
+import os
+import sys
 import time
+import json
+import csv
+import logging
+import argparse
+from typing import List, Dict, Any, Optional
 import requests
-import telebot
-import threading
-from datetime import datetime
 
-# === АВТОМАТИЧЕСКАЯ НАСТРОЙКА ТОКЕНОВ И КЛЮЧЕЙ ===
-TELEGRAM_TOKEN = "ВАШ_ТЕЛЕГРАМ_ТОКЕН"  # Вставьте ваш токен от @BotFather сюда
-SSTATS_API_KEY = "ВАШ_КЛЮЧ_SSTATS"       # Вставьте ваш API-ключ от SStats сюда
-BASE_URL = "https://sstats.net"
+# ====== Конфигурация ======
+BASE_URL = os.getenv("SSTATS_BASE_URL", "https://api.sstats.net").rstrip("/")
+API_KEY = os.getenv("SSTATS_API_KEY")  # если есть
+TIMEZONE = int(os.getenv("SSTATS_TIMEZONE", "3"))
 
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
+LOGFILE = "sstats_fetcher.log"
+DEFAULT_LIMIT = 1000  # максимальный batch, как в описании API
+REQUEST_TIMEOUT = 15
+MAX_RETRIES = 3
+RETRY_BACKOFF = 1.0  # базовый backoff (сек)
 
-# Настройка заголовков авторизации для API SStats
-headers = {
-    "Authorization": f"Bearer {SSTATS_API_KEY}",
-    "Accept": "application/json"
-}
+# ====== Логирование ======
+logger = logging.getLogger("sstats")
+logger.setLevel(logging.INFO)
+fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+ch = logging.StreamHandler(sys.stdout)
+ch.setFormatter(fmt)
+logger.addHandler(ch)
+fh = logging.FileHandler(LOGFILE)
+fh.setFormatter(fmt)
+logger.addHandler(fh)
 
-def safe_float(value, default=0.0):
-    """Защита от болезней ботов: безопасная конвертация типов данных."""
-    if value is None:
-        return default
-    try:
-        return float(value)
-    except (ValueError, TypeError):
-        return default
-
-def get_team_stats_safe(team_id, side):
-    """Безопасный запрос к API с ограничением по времени и обработкой ошибок."""
-    try:
-        url = f"{BASE_URL}/teams/{team_id}/stats"
-        # Тайм-аут 10 секунд защищает от вечного зависания при сбое сети sstats
-        response = requests.get(url, headers=headers, timeout=10)
-        
-        if response.status_code == 200:
-            response_data = response.json()
-            
-            # Регистронезависимая проверка статуса внутри запроса команды
-            status = str(response_data.get("status", "")).lower()
-            if status != "ok":
-                return 0.0
-                
-            data = response_data.get('data', {}) if 'data' in response_data else response_data
-            if side == 'home':
-                return safe_float(data.get('home_goals_scored_avg'))
-            elif side == 'away':
-                return safe_float(data.get('away_goals_conceded_avg'))
-        return 0.0
-    except Exception as e:
-        print(f"Ошибочный ответ сети для команды {team_id}: {e}")
-        return 0.0
-
-def process_predictions_async(chat_id):
-    """Асинхронный движок анализа матчей, работающий в фоновом режиме."""
-    today_date = datetime.now().strftime("%Y-%m-%d")
-    matches_url = f"{BASE_URL}/matches"
-    params = {"date": today_date}
-    
-    try:
-        bot.send_message(chat_id, "🔍 Подключаюсь к SStats API... Начинаю анализ матчей.")
-        response = requests.get(matches_url, headers=headers, params=params, timeout=10)
-        
-        if response.status_code != 200:
-            bot.send_message(chat_id, "⚠️ Ошибка связи с API SStats. Проверьте правильность SSTATS_API_KEY.")
-            return
-            
-        response_data = response.json()
-        
-        # ИСПРАВЛЕНИЕ: Регистронезависимая проверка статуса ответа API ("ok", "OK", "Ok")
-        status = str(response_data.get("status", "")).lower()
-        if status != "ok":
-            bot.send_message(chat_id, f"⚠️ API вернул статус ошибки: {response_data.get('status')}")
-            return
-            
-        matches = response_data.get('data', [])
-        if not matches:
-            bot.send_message(chat_id, "📅 В базе SStats на сегодня матчей для анализа не обнаружено.")
-            return
-            
-        found_signals = 0
-        
-        for match in matches:
-            home_name = match.get('home_team_name', 'Хозяева')
-            away_name = match.get('away_team_name', 'Гости')
-            league = match.get('league_name', 'Лига')
-            
-            home_id = match.get('home_team_id')
-            away_id = match.get('away_team_id')
-            
-            # Извлекаем рейтинги Глико-2
-            home_glicko = safe_float(match.get('home_glicko'), 1500.0)
-            away_glicko = safe_float(match.get('away_glicko'), 1500.0)
-            
-            # КРИТЕРИЙ 1: Порог разницы рейтинга Глико (от 100 пунктов)
-            if (home_glicko - away_glicko) < 100:
-                continue
-                
-            # ОЗДОРОВЛЕНИЕ БОТА: Обязательная пауза перед запросом, чтобы не спамить эндпоинты sstats
-            time.sleep(1.5)
-            
-            # Запрашиваем точечную статистику команд
-            home_goals_avg = get_team_stats_safe(home_id, 'home')
-            away_conceded_avg = get_team_stats_safe(away_id, 'away')
-            
-            # КРИТЕРИИ 2 и 3: Порог результативности строго больше 1.3 голов
-            if home_goals_avg > 1.3 and away_conceded_avg > 1.3:
-                found_signals += 1
-                
-                # Формируем динамический индекс математической уверенности
-                score_weight = (home_goals_avg + away_conceded_avg) * 12
-                glicko_weight = (home_glicko - away_glicko) / 5
-                probability = min(99, int(score_weight + glicko_weight))
-                
-                message_text = (
-                    f"⭐ **СИГНАЛ: ИТБ1 (0.5)**\n"
-                    f"🏆 Лига: {league}\n"
-                    f"⚔️ Матч: {home_name} — {away_name}\n"
-                    f"📈 Рейтинг Glicko-2: {int(home_glicko)} vs {int(away_glicko)} (Разница: +{int(home_glicko-away_glicko)})\n"
-                    f"⚽️ Ср. голов дома (Хозяева): {home_goals_avg}\n"
-                    f"🛡 Ср. пропущено в гостях (Гости): {away_conceded_avg}\n\n"
-                    f"🎯 **Вероятность захода: {probability}%**"
-                )
-                
-                bot.send_message(chat_id, message_text, parse_mode="Markdown")
-                
-        if found_signals == 0:
-            bot.send_message(chat_id, "ℹ️ Сканирование завершено. Матчей под критерии (Глико > 100, голы > 1.3) сегодня нет.")
-        else:
-            bot.send_message(chat_id, f"✅ Анализ окончен. Всего найдено подходящих матчей: {found_signals}")
-            
-    except Exception as general_error:
-        bot.send_message(chat_id, f"❌ Критическая системная ошибка в цикле: {general_error}")
-
-# === ИНТЕРФЕЙС И ОБРАБОТЧИКИ ТЕЛЕГРАМ ===
-
-@bot.message_handler(commands=['start'])
-def welcome_user(message):
-    bot.reply_to(
-        message,
-        "🤖 Исправленный бот-сканер SStats готов к работе.\n"
-        "Нажмите /predict для запуска поиска матчей на **ИТБ1 (0.5)**.\n"
-        "Текущие фильтры: Разница Glicko > 100, Ср. голы > 1.3, Регистронезависимость активна.",
-        parse_mode="Markdown"
-    )
-
-@bot.message_handler(commands=['predict'])
-def run_prediction_thread(message):
-    # Запуск логики в threading.Thread избавляет бота от зависаний при обработке длинных очередей
-    threading.Thread(target=process_predictions_async, args=(message.chat.id,)).start()
-
-if __name__ == '__main__':
-    print("Бот успешно инициализирован и запущен в режиме Long Polling...")
-    
-    # Бесконечный цикл с защитой от разрыва соединения с серверами Telegram
+# ====== HTTP helper с retry/backoff ======
+def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    url = BASE_URL + path
+    params = dict(params or {})
+    if API_KEY:
+        # SStats принимает apikey либо заголовок — в примерах часто в query
+        params.setdefault("apikey", API_KEY)
+    attempt = 0
     while True:
         try:
-            bot.polling(none_stop=True, interval=0, timeout=20)
-        except Exception as telegram_error:
-            print(f"Сбой связи с Telegram: {telegram_error}. Перезапуск через 5 секунд...")
-            time.sleep(5)
+            resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            # попытка распарсить JSON (или вернуть текст)
+            try:
+                body = resp.json()
+            except Exception:
+                body = resp.text
+            if resp.status_code >= 400:
+                logger.warning("HTTP %s for %s (attempt %s): %s", resp.status_code, resp.url, attempt, body)
+                # Если 4xx — не будем ретраить много; но на 429/5xx — попробуем
+                if resp.status_code in (429, 500, 502, 503, 504) and attempt < MAX_RETRIES:
+                    attempt += 1
+                    sleep = RETRY_BACKOFF * (2 ** (attempt - 1))
+                    logger.info("Retrying after %.1f sec...", sleep)
+                    time.sleep(sleep)
+                    continue
+                raise RuntimeError(f"HTTP {resp.status_code} for {resp.url}: {body}")
+            return body
+        except requests.RequestException as e:
+            attempt += 1
+            if attempt > MAX_RETRIES:
+                logger.exception("Request failed for %s after %s attempts", url, attempt)
+                raise
+            sleep = RETRY_BACKOFF * (2 ** (attempt - 1))
+            logger.info("RequestException, retrying after %.1f sec... (%s)", sleep, e)
+            time.sleep(sleep)
+
+# ====== Утилиты парсинга ответов (гибкие поля) ======
+def pick_items(obj: Any) -> List[Dict[str, Any]]:
+    """Попытка взять список матчей из разных вариантов ответа."""
+    if isinstance(obj, list):
+        return obj
+    if not isinstance(obj, dict):
+        return []
+    for k in ("data", "items", "results", "games", "value"):
+        v = obj.get(k)
+        if isinstance(v, list):
+            return v
+    # Если ключей нет, возможно сам объект — один матч
+    # Но здесь ожидаем список
+    return []
+
+def safe_int(v):
+    try:
+        return int(v)
+    except Exception:
+        return None
+
+def extract_score_fields(match: Dict[str, Any]) -> Dict[str, Optional[int]]:
+    """
+    Возвращает словарь с HomeFT и AwayFT (целые) и ScoreRaw (оригинал)
+    Пытается разные варианты полей: Score "2:1", HomeFullTimeScore, FullTime: {...}
+    """
+    out = {"HomeFT": None, "AwayFT": None, "ScoreRaw": None}
+    # 1) попытка composite строка "2:1"
+    for key in ("Score", "FullTimeScore", "Result"):
+        v = match.get(key)
+        if v:
+            s = str(v)
+            out["ScoreRaw"] = s
+            if ":" in s:
+                left, right = s.split(":", 1)
+                try:
+                    out["HomeFT"] = int(left.strip())
+                    out["AwayFT"] = int(right.strip())
+                    return out
+                except Exception:
+                    pass
+    # 2) отдельные поля
+    for hk in ("HomeFullTimeScore", "HomeScore", "HomeGoals"):
+        if hk in match and match.get(hk) is not None:
+            out["HomeFT"] = safe_int(match.get(hk))
+            break
+    for ak in ("AwayFullTimeScore", "AwayScore", "AwayGoals"):
+        if ak in match and match.get(ak) is not None:
+            out["AwayFT"] = safe_int(match.get(ak))
+            break
+    # 3) объект FullTime: {"Home":2, "Away":1}
+    ft = match.get("FullTime") or match.get("FullTimeScoreObj")
+    if isinstance(ft, dict):
+        if out["HomeFT"] is None:
+            out["HomeFT"] = safe_int(ft.get("Home") or ft.get("HomeGoals"))
+        if out["AwayFT"] is None:
+            out["AwayFT"] = safe_int(ft.get("Away") or ft.get("AwayGoals"))
+    return out
+
+def extract_odds_1x2(match: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    """
+    Пытается получить коэффициенты 1X2 в сокращённой записи (если есть).
+    Возможные поля: Odds1/OddsX/Odds2, Odds: {1,X,2}, HomeOdd/DrawOdd/AwayOdd и т.п.
+    """
+    out = {"Odds1": None, "OddsX": None, "Odds2": None}
+    # прямые поля
+    for k in ("Odds1", "HomeOdd", "HomeWin", "OddsHome"):
+        if k in match and match.get(k) is not None:
+            try:
+                out["Odds1"] = float(match.get(k))
+                break
+            except:
+                pass
+    for k in ("OddsX", "DrawOdd", "OddsDraw"):
+        if k in match and match.get(k) is not None:
+            try:
+                out["OddsX"] = float(match.get(k))
+                break
+            except:
+                pass
+    for k in ("Odds2", "AwayOdd", "AwayWin", "OddsAway"):
+        if k in match and match.get(k) is not None:
+            try:
+                out["Odds2"] = float(match.get(k))
+                break
+            except:
+                pass
+    # вложенный объект
+    odds_obj = match.get("Odds") or match.get("OneXTwo") or match.get("Market1X2")
+    if isinstance(odds_obj, dict):
+        for k1,k2,k3 in (("1","X","2"), ("Home","Draw","Away")):
+            try:
+                if out["Odds1"] is None and odds_obj.get(k1) is not None:
+                    out["Odds1"] = float(odds_obj.get(k1))
+                if out["OddsX"] is None and odds_obj.get(k2) is not None:
+                    out["OddsX"] = float(odds_obj.get(k2))
+                if out["Odds2"] is None and odds_obj.get(k3) is not None:
+                    out["Odds2"] = float(odds_obj.get(k3))
+            except:
+                pass
+    return out
+
+def normalize_match(match: Dict[str, Any]) -> Dict[str, Any]:
+    """Собирает нужные поля в единый словарь."""
+    m = {}
+    m["Id"] = match.get("Id") or match.get("id") or match.get("GameId") or match.get("GameID")
+    m["Date"] = match.get("Date") or match.get("MatchDate") or match.get("UtcDate") or match.get("Time")
+    # Teams
+    m["HomeTeamId"] = match.get("HomeTeam") or match.get("HomeTeamId") or match.get("HomeId")
+    m["AwayTeamId"] = match.get("AwayTeam") or match.get("AwayTeamId") or match.get("AwayId")
+    m["HomeTeamName"] = match.get("HomeTeamName") or match.get("HomeName") or match.get("Home") or match.get("HomeTeamTitle")
+    m["AwayTeamName"] = match.get("AwayTeamName") or match.get("AwayName") or match.get("Away") or match.get("AwayTeamTitle")
+    m["Status"] = match.get("Status") or match.get("MatchStatus") or match.get("State")
+    # Score
+    sc = extract_score_fields(match)
+    m.update(sc)
+    # Odds
+    odds = extract_odds_1x2(match)
+    m.update(odds)
+    # Keep original payload reference if need
+    m["_raw"] = match
+    return m
+
+# ====== Основная логика: получить "сегодняшние" матчи (с пагинацией) ======
+def fetch_todays_matches(timezone: int = TIMEZONE, limit: int = DEFAULT_LIMIT) -> List[Dict[str, Any]]:
+    params = {
+        "Today": "true",
+        "TimeZone": str(timezone),
+        "limit": limit,
+        "offset": 0,
+    }
+    if API_KEY:
+        params["apikey"] = API_KEY
+    all_items = []
+    while True:
+        logger.info("Запрос %s offset=%s limit=%s", "/games/list", params["offset"], params["limit"])
+        resp = _get("/games/list", params=params)
+        items = pick_items(resp)
+        if not items:
+            logger.info("Пакет пустой, завершение.")
+            break
+        logger.info("Получено %s матчей в пакете", len(items))
+        all_items.extend(items)
+        if len(items) < limit:
+            break
+        params["offset"] += limit
+        # Небольшая пауза, чтобы не ударить по лимитам
+        time.sleep(0.2)
+    return all_items
+
+def fetch_glicko_for_game(game_id: Any) -> Optional[Dict[str, Any]]:
+    if game_id is None:
+        return None
+    try:
+        path = f"/games/glicko/{game_id}"
+        logger.debug("Fetching glicko for %s", game_id)
+        resp = _get(path, params={"TimeZone": str(TIMEZONE)})
+        return resp
+    except Exception as e:
+        logger.warning("Не удалось получить glicko для %s: %s", game_id, e)
+        return None
+
+# ====== Запись в JSON/CSV ======
+def save_json(data: List[Dict[str, Any]], filename: str):
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    logger.info("Saved JSON: %s", filename)
+
+def save_csv(data: List[Dict[str, Any]], filename: str):
+    if not data:
+        logger.info("Нет данных для CSV.")
+        return
+    # Определяем заголовки (упорядочим ключи)
+    headers = [
+        "Id", "Date", "HomeTeamId", "HomeTeamName", "AwayTeamId", "AwayTeamName",
+        "Status", "HomeFT", "AwayFT", "ScoreRaw", "Odds1", "OddsX", "Odds2"
+    ]
+    # Добавим любые дополнительные ключи, которые есть в данных, но не в headers
+    extra_keys = []
+    for row in data:
+        for k in row.keys():
+            if k not in headers and k != "_raw":
+                extra_keys.append(k)
+    extra_keys = sorted(set(extra_keys))
+    headers.extend(extra_keys)
+
+    with open(filename, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
+        writer.writeheader()
+        for row in data:
+            # Удаляем большой _raw объект из CSV
+            r = {k: row.get(k) for k in headers}
+            writer.writerow(r)
+    logger.info("Saved CSV: %s", filename)
+
+# ====== CLI ======
+def parse_args():
+    p = argparse.ArgumentParser(description="Fetch today's matches from SStats API")
+    p.add_argument("--out-prefix", default="sstats_today", help="Prefix for output files (JSON/CSV)")
+    p.add_argument("--with-glicko", action="store_true", help="Also fetch /games/glicko/{id} for each match (slower)")
+    p.add_argument("--timezone", type=int, default=TIMEZONE, help="TimeZone parameter (default from env or 3)")
+    return p.parse_args()
+
+def main():
+    args = parse_args()
+    logger.info("Starting fetch: timezone=%s with_glicko=%s", args.timezone, args.with_glicko)
+    raw_matches = fetch_todays_matches(timezone=args.timezone)
+    logger.info("Всего матчей за сегодня: %s", len(raw_matches))
+
+    normalized = []
+    for i, m in enumerate(raw_matches, start=1):
+        nm = normalize_match(m)
+        # Если нужно Glicko — подгружаем отдельным запросом (аккуратно с лимитами)
+        if args.with_glicko:
+            gid = nm.get("Id") or nm.get("id")
+            if gid:
+                g = fetch_glicko_for_game(gid)
+                if g:
+                    nm["Glicko"] = g
+                # небольшая пауза между вызовами glicko
+                time.sleep(0.3)
+        normalized.append(nm)
+
+    json_file = f"{args.out_prefix}.json"
+    csv_file = f"{args.out_prefix}.csv"
+    save_json(normalized, json_file)
+    save_csv(normalized, csv_file)
+    logger.info("Готово. JSON: %s, CSV: %s", json_file, csv_file)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        logger.exception("Fatal error: %s", e)
+        sys.exit(2)
 
