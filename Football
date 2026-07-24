@@ -3,16 +3,13 @@
 sstats_fetcher.py
 
 Собирает "сегодняшние" матчи из SStats API (/games/list?Today=true).
-Сохраняет результат в JSON и CSV. Опционально подгружает /games/glicko/{id}.
-
-Настройки через переменные окружения:
+Сохраняет результат в JSON и CSV.
+Настройки через переменные окружения (.env поддерживается автоматически!):
 - SSTATS_API_KEY  (необязательно)
 - SSTATS_BASE_URL (по умолчанию https://api.sstats.net)
 - SSTATS_TIMEZONE (по умолчанию 3)
-
-Пример:
-    python sstats_fetcher.py --out-prefix today_matches --with-glicko
 """
+
 import os
 import sys
 import time
@@ -22,6 +19,13 @@ import logging
 import argparse
 from typing import List, Dict, Any, Optional
 import requests
+
+# === Загрузка переменных из .env (ТЕПЕРЬ ПОДДЕРЖИВАЕТСЯ!) ===
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # если не установлен - просто проигнорировать (но requirements.txt уже содержит python-dotenv)
 
 # ====== Конфигурация ======
 BASE_URL = os.getenv("SSTATS_BASE_URL", "https://api.sstats.net").rstrip("/")
@@ -41,29 +45,29 @@ fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
 ch = logging.StreamHandler(sys.stdout)
 ch.setFormatter(fmt)
 logger.addHandler(ch)
-fh = logging.FileHandler(LOGFILE)
-fh.setFormatter(fmt)
-logger.addHandler(fh)
+try:
+    fh = logging.FileHandler(LOGFILE)
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+except Exception:
+    pass  # если без прав
 
 # ====== HTTP helper с retry/backoff ======
 def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
     url = BASE_URL + path
     params = dict(params or {})
     if API_KEY:
-        # SStats принимает apikey либо заголовок — в примерах часто в query
         params.setdefault("apikey", API_KEY)
     attempt = 0
     while True:
         try:
             resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-            # попытка распарсить JSON (или вернуть текст)
             try:
                 body = resp.json()
             except Exception:
                 body = resp.text
             if resp.status_code >= 400:
                 logger.warning("HTTP %s for %s (attempt %s): %s", resp.status_code, resp.url, attempt, body)
-                # Если 4xx — не будем ретраить много; но на 429/5xx — попробуем
                 if resp.status_code in (429, 500, 502, 503, 504) and attempt < MAX_RETRIES:
                     attempt += 1
                     sleep = RETRY_BACKOFF * (2 ** (attempt - 1))
@@ -81,9 +85,7 @@ def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
             logger.info("RequestException, retrying after %.1f sec... (%s)", sleep, e)
             time.sleep(sleep)
 
-# ====== Утилиты парсинга ответов (гибкие поля) ======
 def pick_items(obj: Any) -> List[Dict[str, Any]]:
-    """Попытка взять список матчей из разных вариантов ответа."""
     if isinstance(obj, list):
         return obj
     if not isinstance(obj, dict):
@@ -92,8 +94,6 @@ def pick_items(obj: Any) -> List[Dict[str, Any]]:
         v = obj.get(k)
         if isinstance(v, list):
             return v
-    # Если ключей нет, возможно сам объект — один матч
-    # Но здесь ожидаем список
     return []
 
 def safe_int(v):
@@ -103,12 +103,7 @@ def safe_int(v):
         return None
 
 def extract_score_fields(match: Dict[str, Any]) -> Dict[str, Optional[int]]:
-    """
-    Возвращает словарь с HomeFT и AwayFT (целые) и ScoreRaw (оригинал)
-    Пытается разные варианты полей: Score "2:1", HomeFullTimeScore, FullTime: {...}
-    """
     out = {"HomeFT": None, "AwayFT": None, "ScoreRaw": None}
-    # 1) попытка composite строка "2:1"
     for key in ("Score", "FullTimeScore", "Result"):
         v = match.get(key)
         if v:
@@ -122,7 +117,6 @@ def extract_score_fields(match: Dict[str, Any]) -> Dict[str, Optional[int]]:
                     return out
                 except Exception:
                     pass
-    # 2) отдельные поля
     for hk in ("HomeFullTimeScore", "HomeScore", "HomeGoals"):
         if hk in match and match.get(hk) is not None:
             out["HomeFT"] = safe_int(match.get(hk))
@@ -131,7 +125,6 @@ def extract_score_fields(match: Dict[str, Any]) -> Dict[str, Optional[int]]:
         if ak in match and match.get(ak) is not None:
             out["AwayFT"] = safe_int(match.get(ak))
             break
-    # 3) объект FullTime: {"Home":2, "Away":1}
     ft = match.get("FullTime") or match.get("FullTimeScoreObj")
     if isinstance(ft, dict):
         if out["HomeFT"] is None:
@@ -141,12 +134,7 @@ def extract_score_fields(match: Dict[str, Any]) -> Dict[str, Optional[int]]:
     return out
 
 def extract_odds_1x2(match: Dict[str, Any]) -> Dict[str, Optional[float]]:
-    """
-    Пытается получить коэффициенты 1X2 в сокращённой записи (если есть).
-    Возможные поля: Odds1/OddsX/Odds2, Odds: {1,X,2}, HomeOdd/DrawOdd/AwayOdd и т.п.
-    """
     out = {"Odds1": None, "OddsX": None, "Odds2": None}
-    # прямые поля
     for k in ("Odds1", "HomeOdd", "HomeWin", "OddsHome"):
         if k in match and match.get(k) is not None:
             try:
@@ -168,10 +156,9 @@ def extract_odds_1x2(match: Dict[str, Any]) -> Dict[str, Optional[float]]:
                 break
             except:
                 pass
-    # вложенный объект
     odds_obj = match.get("Odds") or match.get("OneXTwo") or match.get("Market1X2")
     if isinstance(odds_obj, dict):
-        for k1,k2,k3 in (("1","X","2"), ("Home","Draw","Away")):
+        for k1, k2, k3 in (("1", "X", "2"), ("Home", "Draw", "Away")):
             try:
                 if out["Odds1"] is None and odds_obj.get(k1) is not None:
                     out["Odds1"] = float(odds_obj.get(k1))
@@ -184,27 +171,21 @@ def extract_odds_1x2(match: Dict[str, Any]) -> Dict[str, Optional[float]]:
     return out
 
 def normalize_match(match: Dict[str, Any]) -> Dict[str, Any]:
-    """Собирает нужные поля в единый словарь."""
     m = {}
     m["Id"] = match.get("Id") or match.get("id") or match.get("GameId") or match.get("GameID")
     m["Date"] = match.get("Date") or match.get("MatchDate") or match.get("UtcDate") or match.get("Time")
-    # Teams
     m["HomeTeamId"] = match.get("HomeTeam") or match.get("HomeTeamId") or match.get("HomeId")
     m["AwayTeamId"] = match.get("AwayTeam") or match.get("AwayTeamId") or match.get("AwayId")
     m["HomeTeamName"] = match.get("HomeTeamName") or match.get("HomeName") or match.get("Home") or match.get("HomeTeamTitle")
     m["AwayTeamName"] = match.get("AwayTeamName") or match.get("AwayName") or match.get("Away") or match.get("AwayTeamTitle")
     m["Status"] = match.get("Status") or match.get("MatchStatus") or match.get("State")
-    # Score
     sc = extract_score_fields(match)
     m.update(sc)
-    # Odds
     odds = extract_odds_1x2(match)
     m.update(odds)
-    # Keep original payload reference if need
     m["_raw"] = match
     return m
 
-# ====== Основная логика: получить "сегодняшние" матчи (с пагинацией) ======
 def fetch_todays_matches(timezone: int = TIMEZONE, limit: int = DEFAULT_LIMIT) -> List[Dict[str, Any]]:
     params = {
         "Today": "true",
@@ -227,7 +208,6 @@ def fetch_todays_matches(timezone: int = TIMEZONE, limit: int = DEFAULT_LIMIT) -
         if len(items) < limit:
             break
         params["offset"] += limit
-        # Небольшая пауза, чтобы не ударить по лимитам
         time.sleep(0.2)
     return all_items
 
@@ -243,7 +223,6 @@ def fetch_glicko_for_game(game_id: Any) -> Optional[Dict[str, Any]]:
         logger.warning("Не удалось получить glicko для %s: %s", game_id, e)
         return None
 
-# ====== Запись в JSON/CSV ======
 def save_json(data: List[Dict[str, Any]], filename: str):
     with open(filename, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -253,12 +232,10 @@ def save_csv(data: List[Dict[str, Any]], filename: str):
     if not data:
         logger.info("Нет данных для CSV.")
         return
-    # Определяем заголовки (упорядочим ключи)
     headers = [
         "Id", "Date", "HomeTeamId", "HomeTeamName", "AwayTeamId", "AwayTeamName",
         "Status", "HomeFT", "AwayFT", "ScoreRaw", "Odds1", "OddsX", "Odds2"
     ]
-    # Добавим любые дополнительные ключи, которые есть в данных, но не в headers
     extra_keys = []
     for row in data:
         for k in row.keys():
@@ -271,12 +248,10 @@ def save_csv(data: List[Dict[str, Any]], filename: str):
         writer = csv.DictWriter(f, fieldnames=headers)
         writer.writeheader()
         for row in data:
-            # Удаляем большой _raw объект из CSV
             r = {k: row.get(k) for k in headers}
             writer.writerow(r)
     logger.info("Saved CSV: %s", filename)
 
-# ====== CLI ======
 def parse_args():
     p = argparse.ArgumentParser(description="Fetch today's matches from SStats API")
     p.add_argument("--out-prefix", default="sstats_today", help="Prefix for output files (JSON/CSV)")
@@ -293,14 +268,12 @@ def main():
     normalized = []
     for i, m in enumerate(raw_matches, start=1):
         nm = normalize_match(m)
-        # Если нужно Glicko — подгружаем отдельным запросом (аккуратно с лимитами)
         if args.with_glicko:
             gid = nm.get("Id") or nm.get("id")
             if gid:
                 g = fetch_glicko_for_game(gid)
                 if g:
                     nm["Glicko"] = g
-                # небольшая пауза между вызовами glicko
                 time.sleep(0.3)
         normalized.append(nm)
 
