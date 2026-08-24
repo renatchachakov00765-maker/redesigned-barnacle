@@ -1,18 +1,29 @@
-import os,json,requests
+import os,json,requests,hashlib
 t=os.getenv("BOTTOKEN")
-c=os.getenv("CHAT_ID")
+c=os.getenv("CHATID")
 if not c:
  for k,v in os.environ.items():
-  if v=="5296589826":c=v;print("FOUND",k)
+  if v=="5296589826":c=v
 k=os.getenv("SSTATSKEY")
-print("T:",bool(t),"C:",bool(c),"K:",bool(k))
 p={"Today":"true","TimeZone":"3"}
 if k:p["apikey"]=k
 r=requests.get("https://api.sstats.net/games/list",params=p,timeout=15).json()
 d=r if isinstance(r,list)else r.get("data",[])
-open("sstats_today.json","w").write(json.dumps(d))
-print("M:",len(d))
-if t and c:
- x=requests.post("https://api.telegram.org/bot"+t+"/sendMessage",json={"chat_id":c,"text":"hi"},timeout=10)
- print("TG:",x.status_code)
-else:print("NO")
+open("sstats_today.json","w").write(json.dumps(d,ensure_ascii=False,indent=2))
+n=len(d)
+print("M:",n)
+if not t or not c:
+ print("NO");exit()
+h=hashlib.sha256(json.dumps(d[:10],sort_keys=True).encode()).hexdigest()[:12]
+try:
+ with open(".hash")as f:l=f.read().strip()
+except:l=""
+if h==l:
+ print("SAME");exit()
+with open(".hash","w")as f:f.write(h)
+m="📊 SStats Update\n⚽ Matches: "+str(n)+"\n\n"
+for i,x in enumerate(d[:5],1):
+ m+=str(i)+". "+x.get("HomeTeamName","?")+" vs "+x.get("AwayTeamName","?")+"\n"
+if n>5:m+="\n...and "+str(n-5)+" more"
+requests.post("https://api.telegram.org/bot"+t+"/sendMessage",json={"chat_id":c,"text":m,"parse_mode":"HTML"},timeout=10)
+print("TG: OK")
