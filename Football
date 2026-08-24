@@ -1,9 +1,8 @@
 import os,json,requests
-print("ENV:",list(os.environ.keys()))
-t=os.getenv("TELEGRAM_TOKEN")
-c=os.getenv("CHAT_ID")
-print("TOKEN:",bool(t),"CHAT:",bool(c))
-k=os.getenv("SSTATS_API_KEY")
+t=os.getenv("BOT_TOKEN")or os.getenv("TELEGRAM_BOT_TOKEN")or os.getenv("TOKEN")
+c=os.getenv("USER_ID")
+k=os.getenv("SSTATSKEY")
+print("TOKEN:",bool(t),"CHAT:",bool(c),"KEY:",bool(k))
 p={"Today":"true","TimeZone":"3","limit":1000}
 if k:p["apikey"]=k
 r=requests.get("https://api.sstats.net/games/list",params=p,timeout=15).json()
@@ -11,9 +10,8 @@ d=r if isinstance(r,list)else r.get("data",[])
 open("sstats_today.json","w").write(json.dumps(d,ensure_ascii=False,indent=2))
 print("MATCHES:",len(d))
 if t and c:
- m="📊 "+str(len(d))+" matches"
- if d:m+="\n"+d[0].get("HomeTeamName","?")+" vs "+d[0].get("AwayTeamName","?")
- x=requests.post("https://api.telegram.org/bot"+t+"/sendMessage",json={"chat_id":c,"text":m},timeout=10)
+ m="📊 SStats\n⚽ Matches: "+str(len(d))+"\n"
+ if d:m+=d[0].get("HomeTeamName","?")+" vs "+d[0].get("AwayTeamName","?")
+ x=requests.post("https://api.telegram.org/bot"+t+"/sendMessage",json={"chat_id":c,"text":m,"parse_mode":"HTML"},timeout=10)
  print("TG:",x.status_code)
-else:
- print("NO TG")
+else:print("NO TG")
