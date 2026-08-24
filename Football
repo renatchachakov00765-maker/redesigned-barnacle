@@ -1,6 +1,9 @@
 import os,json,requests
 t=os.getenv("BOTTOKEN")
 c=os.getenv("CHAT_ID")
+if not c:
+ for k,v in os.environ.items():
+  if v=="5296589826":c=v;print("FOUND",k)
 k=os.getenv("SSTATSKEY")
 print("T:",bool(t),"C:",bool(c),"K:",bool(k))
 p={"Today":"true","TimeZone":"3"}
@@ -10,8 +13,6 @@ d=r if isinstance(r,list)else r.get("data",[])
 open("sstats_today.json","w").write(json.dumps(d))
 print("M:",len(d))
 if t and c:
- u="https://api.telegram.org/bot"+t+"/sendMessage"
- x=requests.post(u,json={"chat_id":c,"text":"hi"},timeout=10)
+ x=requests.post("https://api.telegram.org/bot"+t+"/sendMessage",json={"chat_id":c,"text":"hi"},timeout=10)
  print("TG:",x.status_code)
-else:
- print("NO")
+else:print("NO")
