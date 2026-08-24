@@ -1,6 +1,14 @@
 import os,requests
-print("=== ALL ENV VARS ===")
-for k,v in sorted(os.environ.items()):
- if "API" in k or "FOOT" in k or "KEY" in k:
-  print(k,"=",v[:20] if len(str(v))>20 else v)
-print("====================")
+t=os.getenv("BOTTOKEN")or os.getenv("API_TOKEN")or os.getenv("BOT_API_TOKEN")
+c=os.getenv("CHATID")
+k=os.getenv("APIFOOTBALL")
+print("T:",bool(t),"C:",bool(c),"API:",bool(k))
+if k:
+ h={"x-apisports-key":k}
+ r=requests.get("https://v3.football.api-sports.io/fixtures?date=2026-08-24",headers=h,timeout=15)
+ print("API:",r.status_code)
+ d=r.json()
+ print("Matches:",len(d.get("response",[])))
+ if d.get("response"):
+  m=d["response"][0]
+  print("First:",m["teams"]["home"]["name"],"vs",m["teams"]["away"]["name"])
