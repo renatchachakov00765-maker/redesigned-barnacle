@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Football  —  SStats Fetcher v2.0
+Football  —  SStats Fetcher v2.1
 
 • Собирает сегодняшние матчи из SStats API (/games/list?Today=true)
 • Сохраняет JSON + CSV
@@ -31,6 +31,8 @@ import requests
 try:
     from dotenv import load_dotenv
     load_dotenv()
+    load_dotenv("/app/.env")
+    load_dotenv(".env")
 except ImportError:
     pass
 
@@ -39,8 +41,16 @@ BASE_URL = os.getenv("SSTATS_BASE_URL", "https://api.sstats.net").rstrip("/")
 API_KEY = os.getenv("SSTATS_API_KEY")
 TIMEZONE = int(os.getenv("SSTATS_TIMEZONE", "3"))
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+# --- Поиск Telegram-переменных (fallback на разные имена) ---
+def _find_env(names):
+    for n in names:
+        v = os.getenv(n)
+        if v:
+            return v
+    return None
+
+TELEGRAM_TOKEN = _find_env(["TELEGRAM_TOKEN", "BOT_TOKEN", "TG_TOKEN", "TOKEN", "TELEGRAM_BOT_TOKEN"])
+CHAT_ID = _find_env(["CHAT_ID", "TELEGRAM_CHAT_ID", "TG_CHAT_ID", "MY_ID", "USER_ID"])
 
 LOGFILE = "sstats_fetcher.log"
 HASHFILE = ".last_hash"
@@ -63,8 +73,25 @@ try:
 except Exception:
     pass
 
+# ====== Отладка окружения ======
+def log_env_debug():
+    logger.info("=== ENV DEBUG ===")
+    logger.info("CWD: %s", os.getcwd())
+    logger.info("Files in CWD: %s", os.listdir(os.getcwd()))
+    token_found = bool(TELEGRAM_TOKEN)
+    chat_found = bool(CHAT_ID)
+    logger.info("TELEGRAM_TOKEN found: %s (len=%s)", token_found, len(TELEGRAM_TOKEN) if TELEGRAM_TOKEN else 0)
+    logger.info("CHAT_ID found: %s (len=%s)", chat_found, len(CHAT_ID) if CHAT_ID else 0)
+    env_names = sorted(os.environ.keys())
+    logger.info("All env vars: %s", env_names)
+    if not token_found:
+        logger.warning("TELEGRAM_TOKEN НЕ НАЙДЕН. Искали: TELEGRAM_TOKEN, BOT_TOKEN, TG_TOKEN, TOKEN, TELEGRAM_BOT_TOKEN")
+    if not chat_found:
+        logger.warning("CHAT_ID НЕ НАЙДЕН. Искали: CHAT_ID, TELEGRAM_CHAT_ID, TG_CHAT_ID, MY_ID, USER_ID")
+    logger.info("=================")
+
 # ====== Telegram ======
-def send_telegram(text: str, token: Optional[str] = None, chat_id: Optional[str] = None) -> bool:
+def send_telegram(text, token=None, chat_id=None):
     token = token or TELEGRAM_TOKEN
     chat_id = chat_id or CHAT_ID
     if not token or not chat_id:
@@ -86,7 +113,7 @@ def send_telegram(text: str, token: Optional[str] = None, chat_id: Optional[str]
         logger.error("Telegram ERROR: %s", e)
         return False
 
-def send_error_to_telegram(exc: Exception):
+def send_error_to_telegram(exc):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     text = (
         f"🚨 <b>SStats Fetcher — ОШИБКА</b>\n"
@@ -96,7 +123,7 @@ def send_error_to_telegram(exc: Exception):
     send_telegram(text)
 
 # ====== HTTP helper с retry/backoff ======
-def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+def _get(path, params=None):
     url = BASE_URL + path
     params = dict(params or {})
     if API_KEY:
@@ -129,7 +156,7 @@ def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
             time.sleep(sleep)
 
 # ====== Утилиты ======
-def pick_items(obj: Any) -> List[Dict[str, Any]]:
+def pick_items(obj):
     if isinstance(obj, list):
         return obj
     if not isinstance(obj, dict):
@@ -152,7 +179,7 @@ def safe_float(v):
     except Exception:
         return None
 
-def extract_score_fields(match: Dict[str, Any]) -> Dict[str, Optional[int]]:
+def extract_score_fields(match):
     out = {"HomeFT": None, "AwayFT": None, "ScoreRaw": None}
     for key in ("Score", "FullTimeScore", "Result"):
         v = match.get(key)
@@ -183,7 +210,7 @@ def extract_score_fields(match: Dict[str, Any]) -> Dict[str, Optional[int]]:
             out["AwayFT"] = safe_int(ft.get("Away") or ft.get("AwayGoals"))
     return out
 
-def extract_odds_1x2(match: Dict[str, Any]) -> Dict[str, Optional[float]]:
+def extract_odds_1x2(match):
     out = {"Odds1": None, "OddsX": None, "Odds2": None}
     for k in ("Odds1", "HomeOdd", "HomeWin", "OddsHome"):
         if k in match and match.get(k) is not None:
@@ -214,7 +241,7 @@ def extract_odds_1x2(match: Dict[str, Any]) -> Dict[str, Optional[float]]:
                 out["Odds2"] = safe_float(odds_obj.get(k3))
     return out
 
-def normalize_match(match: Dict[str, Any]) -> Dict[str, Any]:
+def normalize_match(match):
     m = {}
     m["Id"] = match.get("Id") or match.get("id") or match.get("GameId") or match.get("GameID")
     m["Date"] = match.get("Date") or match.get("MatchDate") or match.get("UtcDate") or match.get("Time")
@@ -231,7 +258,7 @@ def normalize_match(match: Dict[str, Any]) -> Dict[str, Any]:
     m["_raw"] = match
     return m
 
-def fetch_todays_matches(timezone: int = TIMEZONE, limit: int = DEFAULT_LIMIT) -> List[Dict[str, Any]]:
+def fetch_todays_matches(timezone=TIMEZONE, limit=DEFAULT_LIMIT):
     params = {
         "Today": "true",
         "TimeZone": str(timezone),
@@ -256,7 +283,7 @@ def fetch_todays_matches(timezone: int = TIMEZONE, limit: int = DEFAULT_LIMIT) -
         time.sleep(0.2)
     return all_items
 
-def fetch_glicko_for_game(game_id: Any) -> Optional[Dict[str, Any]]:
+def fetch_glicko_for_game(game_id):
     if game_id is None:
         return None
     try:
@@ -268,12 +295,12 @@ def fetch_glicko_for_game(game_id: Any) -> Optional[Dict[str, Any]]:
         logger.warning("Не удалось получить glicko для %s: %s", game_id, e)
         return None
 
-def save_json(data: List[Dict[str, Any]], filename: str):
+def save_json(data, filename):
     with open(filename, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     logger.info("Saved JSON: %s", filename)
 
-def save_csv(data: List[Dict[str, Any]], filename: str):
+def save_csv(data, filename):
     if not data:
         logger.info("Нет данных для CSV.")
         return
@@ -295,27 +322,25 @@ def save_csv(data: List[Dict[str, Any]], filename: str):
         for row in data:
             r = {k: row.get(k) for k in headers}
             writer.writerow(r)
-    logger.info("Saved CSV: %s", filename)
-
-# ====== Хеш данных (антиспам) ======
-def compute_data_hash(data: List[Dict]) -> str:
+  # ====== Хеш данных (антиспам) ======
+def compute_data_hash(data):
     sample = json.dumps(data[:20], sort_keys=True, ensure_ascii=True)
     raw = f"{len(data)}|{sample}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
-def read_last_hash() -> Optional[str]:
+def read_last_hash():
     try:
         with open(HASHFILE, "r", encoding="utf-8") as f:
             return f.read().strip()
     except Exception:
         return None
 
-def write_last_hash(h: str):
+def write_last_hash(h):
     with open(HASHFILE, "w", encoding="utf-8") as f:
         f.write(h)
 
 # ====== Форматирование сводки ======
-def build_summary(matches: List[Dict[str, Any]], json_file: str, csv_file: str) -> str:
+def build_summary(matches, json_file, csv_file):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
     total = len(matches)
     lines = [
@@ -339,7 +364,7 @@ def build_summary(matches: List[Dict[str, Any]], json_file: str, csv_file: str) 
             lines.append(f"{i}. {home} vs {away}{odds_str}")
         lines.append("")
 
-    leagues: Dict[str, int] = {}
+    leagues = {}
     for m in matches:
         lg = m.get("League") or "Unknown"
         leagues[lg] = leagues.get(lg, 0) + 1
@@ -366,6 +391,7 @@ def parse_args():
 # ====== Main ======
 def main():
     args = parse_args()
+    log_env_debug()
     logger.info("Starting fetch: timezone=%s with_glicko=%s telegram=%s",
                 args.timezone, args.with_glicko, not args.no_telegram)
 
@@ -410,4 +436,4 @@ if __name__ == "__main__":
     except Exception as e:
         logger.exception("Fatal error: %s", e)
         send_error_to_telegram(e)
-        sys.exit(2)
+        sys.exit(2)  logger.info("Saved CSV: %s", filename)
