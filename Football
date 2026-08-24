@@ -1,19 +1,15 @@
 import os,json,requests
-t=os.getenv("BOT_TOKEN")or os.getenv("TELEGRAM_BOT_TOKEN")
+t=os.getenv("BOT_TOKEN")
 c=os.getenv("USER_ID")
-k=os.getenv("SSTATSKEY")
-print("T:",bool(t),"C:",bool(c),"K:",bool(k))
-p={"Today":"true","TimeZone":"3","limit":1000}
-if k:p["apikey"]=k
+print("C=",c)
+p={"Today":"true","TimeZone":"3"}
 r=requests.get("https://api.sstats.net/games/list",params=p,timeout=15).json()
 d=r if isinstance(r,list)else r.get("data",[])
-open("sstats_today.json","w").write(json.dumps(d,ensure_ascii=False,indent=2))
-print("M:",len(d))
+open("sstats_today.json","w").write(json.dumps(d))
+print("M=",len(d))
 if t and c:
- m="Matches: "+str(len(d))
- if d:m+="\n"+d[0].get("HomeTeamName","?")+" vs "+d[0].get("AwayTeamName","?")
- url="https://api.telegram.org/bot"+t+"/sendMessage"
- payload={"chat_id":c,"text":m}
- x=requests.post(url,json=payload,timeout=10)
- print("TG:",x.status_code,x.text)
-else:print("NO TG")
+ u="https://api.telegram.org/bot"+t+"/sendMessage"
+ x=requests.post(u,json={"chat_id":c,"text":"hi"},timeout=10)
+ print("TG",x.status_code,x.text)
+else:
+ print("NO")
