@@ -1,13 +1,6 @@
 import os,requests
-k=os.getenv("APIFOOTBALL_KEY")
-print("KEY exists:",bool(k))
-
-# Формат 1 (API-Sports напрямую)
-h1={"x-apisports-key":k}
-r1=requests.get("https://v3.football.api-sports.io/fixtures?date=2026-08-24",headers=h1,timeout=15)
-print("V1:",r1.status_code,r1.text[:100])
-
-# Формат 2 (RapidAPI)
-h2={"x-rapidapi-key":k,"x-rapidapi-host":"v3.football.api-sports.io"}
-r2=requests.get("https://v3.football.api-sports.io/fixtures?date=2026-08-24",headers=h2,timeout=15)
-print("V2:",r2.status_code,r2.text[:100])
+print("=== ALL ENV VARS ===")
+for k,v in sorted(os.environ.items()):
+ if "API" in k or "FOOT" in k or "KEY" in k:
+  print(k,"=",v[:20] if len(str(v))>20 else v)
+print("====================")
