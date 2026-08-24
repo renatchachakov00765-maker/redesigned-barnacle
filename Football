@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-sstats_fetcher.py  —  v2.0
+Football  —  SStats Fetcher v2.0
 
 • Собирает сегодняшние матчи из SStats API (/games/list?Today=true)
 • Сохраняет JSON + CSV
@@ -299,7 +299,6 @@ def save_csv(data: List[Dict[str, Any]], filename: str):
 
 # ====== Хеш данных (антиспам) ======
 def compute_data_hash(data: List[Dict]) -> str:
-    """Хеш по первым 20 матчам + общему количеству."""
     sample = json.dumps(data[:20], sort_keys=True, ensure_ascii=True)
     raw = f"{len(data)}|{sample}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
@@ -325,7 +324,6 @@ def build_summary(matches: List[Dict[str, Any]], json_file: str, csv_file: str) 
         f"⚽ Всего матчей: <b>{total}</b>",
         "",
     ]
-    # Первые 5 матчей
     preview = matches[:5]
     if preview:
         lines.append("🔝 Первые матчи:")
@@ -341,7 +339,6 @@ def build_summary(matches: List[Dict[str, Any]], json_file: str, csv_file: str) 
             lines.append(f"{i}. {home} vs {away}{odds_str}")
         lines.append("")
 
-    # Статус по лигам
     leagues: Dict[str, int] = {}
     for m in matches:
         lg = m.get("League") or "Unknown"
@@ -392,7 +389,6 @@ def main():
     save_json(normalized, json_file)
     save_csv(normalized, csv_file)
 
-    # Telegram
     if not args.no_telegram and TELEGRAM_TOKEN and CHAT_ID:
         current_hash = compute_data_hash(normalized)
         last_hash = read_last_hash()
