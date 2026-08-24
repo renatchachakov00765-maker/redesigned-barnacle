@@ -1,15 +1,17 @@
 import os,json,requests
-t=os.getenv("BOT_TOKEN")
-c=os.getenv("USER_ID")
-print("C=",c)
+t=os.getenv("BOTTOKEN")
+c=os.getenv("CHAT_ID")
+k=os.getenv("SSTATSKEY")
+print("T:",bool(t),"C:",bool(c),"K:",bool(k))
 p={"Today":"true","TimeZone":"3"}
+if k:p["apikey"]=k
 r=requests.get("https://api.sstats.net/games/list",params=p,timeout=15).json()
 d=r if isinstance(r,list)else r.get("data",[])
 open("sstats_today.json","w").write(json.dumps(d))
-print("M=",len(d))
+print("M:",len(d))
 if t and c:
  u="https://api.telegram.org/bot"+t+"/sendMessage"
  x=requests.post(u,json={"chat_id":c,"text":"hi"},timeout=10)
- print("TG",x.status_code,x.text)
+ print("TG:",x.status_code)
 else:
  print("NO")
