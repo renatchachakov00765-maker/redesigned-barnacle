@@ -1,14 +1,19 @@
 import os,requests
-t=os.getenv("BOTTOKEN")or os.getenv("API_TOKEN")or os.getenv("BOT_API_TOKEN")
-c=os.getenv("CHATID")
 k=os.getenv("APIFOOTBALL")
-print("T:",bool(t),"C:",bool(c),"API:",bool(k))
-if k:
- h={"x-apisports-key":k}
- r=requests.get("https://v3.football.api-sports.io/fixtures?date=2026-08-24",headers=h,timeout=15)
- print("API:",r.status_code)
- d=r.json()
- print("Matches:",len(d.get("response",[])))
- if d.get("response"):
-  m=d["response"][0]
-  print("First:",m["teams"]["home"]["name"],"vs",m["teams"]["away"]["name"])
+h={"x-apisports-key":k}
+r=requests.get("https://v3.football.api-sports.io/fixtures?last=1",headers=h,timeout=15)
+d=r.json()
+print("Status:",r.status_code)
+if d.get("response"):
+ m=d["response"][0]
+ fid=m["fixture"]["id"]
+ print("Match:",m["teams"]["home"]["name"],"vs",m["teams"]["away"]["name"])
+ r2=requests.get(f"https://v3.football.api-sports.io/fixtures/statistics?fixture={fid}",headers=h,timeout=15)
+ d2=r2.json()
+ print("Stats:",len(d2.get("response",[])))
+ if d2.get("response"):
+  for ts in d2["response"]:
+   print("Team:",ts["team"]["name"])
+   for s in ts.get("statistics",[]):
+    if s["type"] in ["Shots on Goal","Corner Kicks","Fouls"]:
+     print(" ",s["type"],":",s["value"])
