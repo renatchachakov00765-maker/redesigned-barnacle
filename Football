@@ -4,50 +4,28 @@ t=os.getenv("BOTTOKEN")or os.getenv("API_TOKEN")
 c=os.getenv("CHATID")
 h={"x-apisports-key":k}
 
-def team_stats(team_id):
- r=requests.get(f"https://v3.football.api-sports.io/fixtures?team={team_id}&last=5",headers=h,timeout=15)
+# Проверяем матчи на сегодня и вчера
+for date in ["2026-08-25","2026-08-24","2026-08-23"]:
+ r=requests.get(f"https://v3.football.api-sports.io/fixtures?date={date}",headers=h,timeout=15)
  d=r.json()
- shots=corners=fouls=sot=0
- n=0
- for m in d.get("response",[]):
+ print(f"Date {date}: {len(d.get('response',[]))} matches")
+ if d.get("response"):
+  m=d["response"][0]
+  print(f"  First: {m['teams']['home']['name']} vs {m['teams']['away']['name']} ({m['league']['name']})")
+  # Проверяем статистику
   fid=m["fixture"]["id"]
   r2=requests.get(f"https://v3.football.api-sports.io/fixtures/statistics?fixture={fid}",headers=h,timeout=15)
   d2=r2.json()
-  for ts in d2.get("response",[]):
-   if ts["team"]["id"]==team_id:
+  print(f"  Stats: {len(d2.get('response',[]))} teams")
+  if d2.get("response"):
+   for ts in d2["response"]:
+    print(f"    {ts['team']['name']} stats:")
     for s in ts.get("statistics",[]):
-     v=s["value"]or 0
-     if s["type"]=="Shots on Goal":sot+=v
-     if s["type"]=="Total Shots":shots+=v
-     if s["type"]=="Corner Kicks":corners+=v
-     if s["type"]=="Fouls":fouls+=v
-    n+=1
- if n==0:return None
- return{"sot":sot/n,"shots":shots/n,"corners":corners/n,"fouls":fouls/n}
+     if s["type"] in ["Shots on Goal","Total Shots","Corner Kicks","Fouls"]:
+      print(f"      {s['type']}: {s['value']}")
+  break
 
-# Матчи на сегодня
-r=requests.get("https://v3.football.api-sports.io/fixtures?live=all",headers=h,timeout=15)
-d=r.json()
-matches=d.get("response",[])[:5]
-print("Matches:",len(matches))
-
-msg="📊 ОУУ Сканер\n\n"
-for m in matches:
- hid=m["teams"]["home"]["id"]
- aid=m["teams"]["away"]["id"]
- hs=team_stats(hid)
- as_=team_stats(aid)
- if hs and as_:
-  home=m["teams"]["home"]["name"]
-  away=m["teams"]["away"]["name"]
-  msg+=f"⚽ {home} vs {away}\n"
-  msg+=f" 🚩 Угловые: {(hs['corners']+as_['corners'])/2:.1f}\n"
-  msg+=f" 🎯 Удары: {(hs['shots']+as_['shots'])/2:.1f}\n"
-  msg+=f" ⚡ SOT: {(hs['sot']+as_['sot'])/2:.1f}\n"
-  msg+=f" 🟨 Фолы: {(hs['fouls']+as_['fouls'])/2:.1f}\n\n"
-
-if t and c and len(msg)>30:
- requests.post("https://api.telegram.org/bot"+t+"/sendMessage",json={"chat_id":c,"text":msg},timeout=10)
- print("SENT")
-else:
- print("NO DATA or NO TG")
+# Telegram test
+if t and c:
+ requests.post("https://api.telegram.org/bot"+t+"/sendMessage",json={"chat_id":c,"text":"API test done"},timeout=10)
+ print("TG sent")
