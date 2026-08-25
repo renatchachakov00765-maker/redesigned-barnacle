@@ -1,99 +1,354 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-API-Football Diagnosis v2 — с защитой от rate limit
+sstats_explorer.py
+Диагностика API sstats.net: эндпоинты, структура ответов, доступные метрики.
+Результаты сохраняются в /app/data/sstats_*.json
 """
-import os
-import time
+
 import requests
 import json
+import os
+import time
 from datetime import datetime, timedelta
 
-API_KEY = os.getenv("APIFOOTBALL", "a1567f0073f6c6e6ae70")
-BASE_URL = "https://v3.football.api-sports.io"
-HEADERS = {"x-apisports-key": API_KEY}
+# ==================== КОНФИГ ====================
+API_KEY = os.getenv("SSTATSKEY", "1zbc100xzmi2lnsq")
+BASE_URLS = [
+    "https://sstats.net",
+    "https://api.sstats.net",
+    "https://www.sstats.net",
+]
+DATA_DIR = os.getenv("DATA_DIR", "/app/data")
+os.makedirs(DATA_DIR, exist_ok=True)
 
-def api_call(endpoint, params=None, max_retries=3):
-    """Make API call with retry on 429"""
-    url = f"{BASE_URL}/{endpoint}"
-    for attempt in range(max_retries):
+TODAY = datetime.now().strftime("%Y-%m-%d")
+YESTERDAY = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+# Заголовки для разных способов авторизации
+HEADERS_KEY = {
+    "X-API-Key": API_KEY,
+    "Authorization": f"Bearer {API_KEY}",
+    "api-key": API_KEY,
+    "Content-Type": "application/json",
+    "User-Agent": "sstats-explorer/1.0"
+}
+
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "sstats-explorer/1.0"})
+
+results_log = []
+
+# ==================== УТИЛИТЫ ====================
+
+def save_json(name, data):
+    path = os.path.join(DATA_DIR, f"sstats_{name}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print(f"💾 Сохранено: {path}")
+    return path
+
+def log_result(test_name, url, status, data, error=None):
+    entry = {
+        "test": test_name,
+        "url": url,
+        "status": status,
+        "timestamp": datetime.now().isoformat(),
+        "data_preview": str(data)[:500] if data else None,
+        "error": str(error) if error else None
+    }
+    results_log.append(entry)
+    status_icon = "✅" if status == 200 else "⚠️" if status else "❌"
+    print(f"{status_icon} [{test_name}] HTTP {status} | {url}")
+    if error:
+        print(f"   Ошибка: {error}")
+
+def safe_request(method, url, **kwargs):
+    try:
+        resp = SESSION.request(method, url, timeout=15, **kwargs)
         try:
-            resp = requests.get(url, headers=HEADERS, params=params, timeout=15)
-            remaining = resp.headers.get('x-ratelimit-requests-remaining', 'N/A')
-            limit_day = resp.headers.get('x-ratelimit-requests-limit', 'N/A')
-            
-            print(f"\n📡 {endpoint} | params={params}")
-            print(f"   Status: {resp.status_code} | Remaining today: {remaining}/{limit_day}")
-            
-            if resp.status_code == 429:
-                retry_after = int(resp.headers.get('Retry-After', 60))
-                print(f"   ⏳ Rate limit! Ждём {retry_after}с... (попытка {attempt+1}/{max_retries})")
-                time.sleep(retry_after)
-                continue
-            
             data = resp.json()
-            print(f"   Results: {data.get('results', 0)}")
-            if data.get('errors'):
-                print(f"   ⚠️ Errors: {data['errors']}")
-            return data
-            
-        except Exception as e:
-            print(f"   ❌ Exception: {e}")
-            if attempt < max_retries - 1:
-                time.sleep(5)
-    return None
+        except Exception:
+            data = {"raw_text": resp.text[:1000]}
+        return resp.status_code, data, None
+    except Exception as e:
+        return None, None, e
 
-def main():
-    today = datetime.now().strftime("%Y-%m-%d")
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+# ==================== ТЕСТЫ ====================
+
+def test_base_urls():
+    """Тест 1: Просто проверяем, жив ли домен."""
+    print("\n🔎 ТЕСТ 1: Базовые URL (GET /)")
+    for base in BASE_URLS:
+        status, data, err = safe_request("GET", base)
+        log_result(f"base_{base.replace('https://','')}", base, status, data, err)
+        time.sleep(0.5)
+
+def test_api_versions():
+    """Тест 2: Ищем /api, /api/v1, /v1 и т.д."""
+    print("\n🔎 ТЕСТ 2: Версии API")
+    paths = ["/api", "/api/v1", "/v1", "/v2", "/api/v2", "/rest", "/rest/v1"]
+    for base in BASE_URLS:
+        for path in paths:
+            url = f"{base}{path}"
+            status, data, err = safe_request("GET", url)
+            log_result(f"api_ver_{path.replace('/','_')}", url, status, data, err)
+            time.sleep(0.3)
+
+def test_auth_methods():
+    """Тест 3: Разные способы передачи ключа."""
+    print("\n🔎 ТЕСТ 3: Способы авторизации")
     
-    print("=" * 60)
-    print("API-FOOTBALL DIAGNOSIS v2 (с задержками)")
-    print(f"Date: {today} | Key: {API_KEY[:8]}...")
-    print("=" * 60)
+    # Пробуем наиболее вероятные базовые пути
+    test_paths = ["/api/v1/fixtures", "/api/v1/matches", "/api/v1/live", "/api/v1/leagues"]
     
-    # 1. Проверка ключа
-    print("\n--- 1. AUTH TEST ---")
-    status = api_call("status")
-    time.sleep(3)  # Пауза между запросами
+    for base in BASE_URLS:
+        for path in test_paths:
+            # 3a: Query param ?key=...
+            url = f"{base}{path}?key={API_KEY}&date={TODAY}"
+            status, data, err = safe_request("GET", url)
+            log_result(f"auth_query_{path.replace('/','_')}", url, status, data, err)
+            
+            # 3b: Header X-API-Key
+            url = f"{base}{path}?date={TODAY}"
+            status, data, err = safe_request("GET", url, headers=HEADERS_KEY)
+            log_result(f"auth_header_{path.replace('/','_')}", url, status, data, err)
+            
+            # 3c: Query param ?api_key=...
+            url = f"{base}{path}?api_key={API_KEY}&date={TODAY}"
+            status, data, err = safe_request("GET", url)
+            log_result(f"auth_apikey_{path.replace('/','_')}", url, status, data, err)
+            
+            # 3d: Query param ?token=...
+            url = f"{base}{path}?token={API_KEY}&date={TODAY}"
+            status, data, err = safe_request("GET", url)
+            log_result(f"auth_token_{path.replace('/','_')}", url, status, data, err)
+            
+            time.sleep(0.3)
+
+def test_fixtures_endpoints():
+    """Тест 4: Поиск матчей — разные варианты путей и параметров."""
+    print("\n🔎 ТЕСТ 4: Эндпоинты матчей (fixtures/matches/games)")
     
-    # 2. Матчи за сегодня
-    print("\n--- 2. FIXTURES BY DATE ---")
-    fixtures_today = api_call("fixtures", {"date": today})
-    count_today = fixtures_today.get('results', 0) if fixtures_today else 0
-    print(f"   Total fixtures today: {count_today}")
-    time.sleep(3)
+    path_variants = [
+        "/api/v1/fixtures",
+        "/api/v1/matches",
+        "/api/v1/games",
+        "/api/v1/schedule",
+        "/api/v1/events",
+        "/v1/fixtures",
+        "/fixtures",
+    ]
     
-    # 3. Live матчи по конкретным лигам (АПЛ=39, Ла Лига=140, Серия А=135)
-    print("\n--- 3. LIVE BY LEAGUE IDs ---")
-    live_leagues = api_call("fixtures", {"live": "39-140-135-61-78-94"})
-    count_ll = live_leagues.get('results', 0) if live_leagues else 0
-    print(f"   Live in top leagues: {count_ll}")
-    time.sleep(3)
+    param_sets = [
+        {"date": TODAY},
+        {"date": YESTERDAY, "status": "FT"},
+        {"live": "all"},
+        {"live": "true"},
+        {"status": "LIVE"},
+        {"league": "39", "season": "2026"},  # АПЛ
+    ]
     
-    # 4. Матчи за вчера (завершённые)
-    print("\n--- 4. YESTERDAY'S FIXTURES ---")
-    fixtures_yest = api_call("fixtures", {"date": yesterday, "status": "FT"})
-    count_yest = fixtures_yest.get('results', 0) if fixtures_yest else 0
-    print(f"   Finished yesterday: {count_yest}")
-    time.sleep(3)
+    for base in BASE_URLS:
+        for path in path_variants:
+            for params in param_sets:
+                # Пробуем с ключом в query (самый распространённый способ)
+                p = params.copy()
+                p["key"] = API_KEY
+                url = f"{base}{path}"
+                status, data, err = safe_request("GET", url, params=p)
+                test_name = f"fixtures_{path.replace('/','_')}_{'_'.join(f'{k}-{v}' for k,v in params.items())}"
+                log_result(test_name[:80], url + "?" + "&".join(f"{k}={v}" for k,v in p.items()), status, data, err)
+                time.sleep(0.3)
+
+def test_statistics_endpoints():
+    """Тест 5: Статистика конкретного матча (нужен fixture_id)."""
+    print("\n🔎 ТЕСТ 5: Статистика матча")
     
-    # 5. Статистика по первому завершённому матчу
-    print("\n--- 5. FIXTURE STATISTICS ---")
-    if fixtures_yest and fixtures_yest.get('response') and count_yest > 0:
-        first_id = fixtures_yest['response'][0]['fixture']['id']
-        print(f"   Testing with fixture_id={first_id}")
-        stats = api_call("fixtures/statistics", {"fixture": first_id})
-        if stats and stats.get('response'):
-            for team_stats in stats['response']:
-                team_name = team_stats['team']['name']
-                shots = next((s['value'] for s in team_stats['statistics'] if s['type'] == 'Shots on Goal'), 'N/A')
-                corners = next((s['value'] for s in team_stats['statistics'] if s['type'] == 'Corner Kicks'), 'N/A')
-                print(f"   {team_name}: Shots={shots}, Corners={corners}")
-    else:
-        print("   ⚠️ No finished fixtures to test statistics")
+    # Используем «фиктивный» ID, чтобы увидеть структуру ошибки/ответа
+    dummy_id = "123456"
     
-    print("\n" + "=" * 60)
-    print("DIAGNOSIS COMPLETE")
-    print("=" * 60)
+    stat_paths = [
+        f"/api/v1/fixtures/statistics/{dummy_id}",
+        f"/api/v1/statistics/fixture/{dummy_id}",
+        f"/api/v1/matches/{dummy_id}/statistics",
+        f"/api/v1/fixtures/{dummy_id}/stats",
+        f"/api/v1/events/{dummy_id}/statistics",
+        f"/v1/fixtures/statistics",
+        f"/statistics/{dummy_id}",
+    ]
+    
+    for base in BASE_URLS:
+        for path in stat_paths:
+            url = f"{base}{path}?key={API_KEY}"
+            status, data, err = safe_request("GET", url)
+            log_result(f"stats_{path.replace('/','_')[:60]}", url, status, data, err)
+            time.sleep(0.3)
+
+def test_leagues_teams():
+    """Тест 6: Лиги и команды."""
+    print("\n🔎 ТЕСТ 6: Лиги и команды")
+    
+    paths = [
+        "/api/v1/leagues",
+        "/api/v1/teams",
+        "/api/v1/countries",
+        "/api/v1/seasons",
+        "/v1/leagues",
+        "/leagues",
+    ]
+    
+    for base in BASE_URLS:
+        for path in paths:
+            url = f"{base}{path}?key={API_KEY}"
+            status, data, err = safe_request("GET", url)
+            log_result(f"meta_{path.replace('/','_')}", url, status, data, err)
+            time.sleep(0.3)
+
+def test_odds_endpoints():
+    """Тест 7: Коэффициенты (если доступны)."""
+    print("\n🔎 ТЕСТ 7: Коэффициенты / odds")
+    
+    paths = [
+        "/api/v1/odds",
+        "/api/v1/odds/live",
+        "/api/v1/betting/odds",
+        "/v1/odds",
+    ]
+    
+    for base in BASE_URLS:
+        for path in paths:
+            url = f"{base}{path}?key={API_KEY}&date={TODAY}"
+            status, data, err = safe_request("GET", url)
+            log_result(f"odds_{path.replace('/','_')}", url, status, data, err)
+            time.sleep(0.3)
+
+def test_post_methods():
+    """Тест 8: Пробуем POST (некоторые API требуют POST для сложных фильтров)."""
+    print("\n🔎 ТЕСТ 8: POST-запросы")
+    
+    post_bodies = [
+        {"key": API_KEY, "date": TODAY},
+        {"api_key": API_KEY, "leagues": [39, 140, 135]},
+        {"token": API_KEY, "live": True},
+    ]
+    
+    post_paths = ["/api/v1/fixtures", "/api/v1/matches", "/v1/fixtures"]
+    
+    for base in BASE_URLS:
+        for path in post_paths:
+            for body in post_bodies:
+                url = f"{base}{path}"
+                status, data, err = safe_request("POST", url, json=body)
+                log_result(f"post_{path.replace('/','_')}_{list(body.keys())[0]}", url, status, data, err)
+                time.sleep(0.3)
+
+def test_inplay_live():
+    """Тест 9: Live / in-play."""
+    print("\n🔎 ТЕСТ 9: Live-матчи")
+    
+    paths = [
+        "/api/v1/fixtures/live",
+        "/api/v1/live",
+        "/api/v1/inplay",
+        "/api/v1/matches/live",
+        "/v1/live",
+        "/live",
+    ]
+    
+    for base in BASE_URLS:
+        for path in paths:
+            url = f"{base}{path}?key={API_KEY}"
+            status, data, err = safe_request("GET", url)
+            log_result(f"live_{path.replace('/','_')}", url, status, data, err)
+            time.sleep(0.3)
+
+def test_head2h():
+    """Тест 10: H2H / история встреч."""
+    print("\n🔎 ТЕСТ 10: H2H / head2head")
+    
+    # Фиктивные ID команд
+    h2h_paths = [
+        "/api/v1/fixtures/headtohead?h2h=33-34",
+        "/api/v1/h2h?teams=33-34",
+        "/api/v1/matches/h2h?team1=33&team2=34",
+    ]
+    
+    for base in BASE_URLS:
+        for path in h2h_paths:
+            url = f"{base}{path}&key={API_KEY}"
+            status, data, err = safe_request("GET", url)
+            log_result(f"h2h_{path.replace('/','_')[:50]}", url, status, data, err)
+            time.sleep(0.3)
+
+# ==================== ОТЧЁТ ====================
+
+def generate_report():
+    """Финальный отчёт + сохранение полного лога."""
+    print("\n" + "="*60)
+    print("📊 ФИНАЛЬНЫЙ ОТЧЁТ")
+    print("="*60)
+    
+    successful = [r for r in results_log if r["status"] == 200]
+    failed = [r for r in results_log if r["status"] != 200]
+    errors = [r for r in results_log if r["error"]]
+    
+    print(f"Всего тестов: {len(results_log)}")
+    print(f"✅ HTTP 200: {len(successful)}")
+    print(f"⚠️  Остальные статусы: {len(failed)}")
+    print(f"❌ Ошибки соединения: {len(errors)}")
+    
+    # Ищем тесты, где вернулся непустой JSON с 'response' или 'data' или списком
+    promising = []
+    for r in results_log:
+        if r["status"] == 200 and r["data_preview"]:
+            preview = r["data_preview"]
+            if len(preview) > 50 and not preview.startswith("<"):
+                promising.append(r)
+    
+    print(f"\n🎯 Перспективные ответы (200 + непустой JSON): {len(promising)}")
+    for p in promising[:10]:
+        print(f"   → {p['test']}: {p['url']}")
+        print(f"     Превью: {p['data_preview'][:120]}...")
+    
+    # Сохраняем полный лог
+    save_json("full_diagnosis_log", results_log)
+    
+    # Сохраняем «сводку» только успешных
+    save_json("successful_endpoints", {
+        "count": len(successful),
+        "endpoints": [
+            {"test": r["test"], "url": r["url"], "preview": r["data_preview"][:200]}
+            for r in successful
+        ]
+    })
+    
+    print("\n📁 Все файлы сохранены в:", DATA_DIR)
+    print("   - sstats_full_diagnosis_log.json")
+    print("   - sstats_successful_endpoints.json")
+    print("   - И все отдельные *.json для каждого теста")
+
+# ==================== MAIN ====================
 
 if __name__ == "__main__":
-    main()
+    print("="*60)
+    print("🚀 SSTATS.NET API EXPLORER")
+    print(f"📅 Дата теста: {TODAY}")
+    print(f"🔑 Ключ: {API_KEY[:8]}...{API_KEY[-4:]}")
+    print(f"📂 Выходная директория: {DATA_DIR}")
+    print("="*60)
+    
+    test_base_urls()
+    test_api_versions()
+    test_auth_methods()
+    test_fixtures_endpoints()
+    test_statistics_endpoints()
+    test_leagues_teams()
+    test_odds_endpoints()
+    test_post_methods()
+    test_inplay_live()
+    test_head2h()
+    
+    generate_report()
+    
+    print("\n✅ Диагностика завершена. Забери файлы из папки data.")
