@@ -1,19 +1,53 @@
 import os,requests
 k=os.getenv("APIFOOTBALL")
+t=os.getenv("BOTTOKEN")or os.getenv("API_TOKEN")
+c=os.getenv("CHATID")
 h={"x-apisports-key":k}
-r=requests.get("https://v3.football.api-sports.io/fixtures?last=1",headers=h,timeout=15)
+
+def team_stats(team_id):
+ r=requests.get(f"https://v3.football.api-sports.io/fixtures?team={team_id}&last=5",headers=h,timeout=15)
+ d=r.json()
+ shots=corners=fouls=sot=0
+ n=0
+ for m in d.get("response",[]):
+  fid=m["fixture"]["id"]
+  r2=requests.get(f"https://v3.football.api-sports.io/fixtures/statistics?fixture={fid}",headers=h,timeout=15)
+  d2=r2.json()
+  for ts in d2.get("response",[]):
+   if ts["team"]["id"]==team_id:
+    for s in ts.get("statistics",[]):
+     v=s["value"]or 0
+     if s["type"]=="Shots on Goal":sot+=v
+     if s["type"]=="Total Shots":shots+=v
+     if s["type"]=="Corner Kicks":corners+=v
+     if s["type"]=="Fouls":fouls+=v
+    n+=1
+ if n==0:return None
+ return{"sot":sot/n,"shots":shots/n,"corners":corners/n,"fouls":fouls/n}
+
+# Матчи на сегодня
+r=requests.get("https://v3.football.api-sports.io/fixtures?live=all",headers=h,timeout=15)
 d=r.json()
-print("Status:",r.status_code)
-if d.get("response"):
- m=d["response"][0]
- fid=m["fixture"]["id"]
- print("Match:",m["teams"]["home"]["name"],"vs",m["teams"]["away"]["name"])
- r2=requests.get(f"https://v3.football.api-sports.io/fixtures/statistics?fixture={fid}",headers=h,timeout=15)
- d2=r2.json()
- print("Stats:",len(d2.get("response",[])))
- if d2.get("response"):
-  for ts in d2["response"]:
-   print("Team:",ts["team"]["name"])
-   for s in ts.get("statistics",[]):
-    if s["type"] in ["Shots on Goal","Corner Kicks","Fouls"]:
-     print(" ",s["type"],":",s["value"])
+matches=d.get("response",[])[:5]
+print("Matches:",len(matches))
+
+msg="📊 ОУУ Сканер\n\n"
+for m in matches:
+ hid=m["teams"]["home"]["id"]
+ aid=m["teams"]["away"]["id"]
+ hs=team_stats(hid)
+ as_=team_stats(aid)
+ if hs and as_:
+  home=m["teams"]["home"]["name"]
+  away=m["teams"]["away"]["name"]
+  msg+=f"⚽ {home} vs {away}\n"
+  msg+=f" 🚩 Угловые: {(hs['corners']+as_['corners'])/2:.1f}\n"
+  msg+=f" 🎯 Удары: {(hs['shots']+as_['shots'])/2:.1f}\n"
+  msg+=f" ⚡ SOT: {(hs['sot']+as_['sot'])/2:.1f}\n"
+  msg+=f" 🟨 Фолы: {(hs['fouls']+as_['fouls'])/2:.1f}\n\n"
+
+if t and c and len(msg)>30:
+ requests.post("https://api.telegram.org/bot"+t+"/sendMessage",json={"chat_id":c,"text":msg},timeout=10)
+ print("SENT")
+else:
+ print("NO DATA or NO TG")
