@@ -1,31 +1,118 @@
-import os,requests
-k=os.getenv("APIFOOTBALL")
-t=os.getenv("BOTTOKEN")or os.getenv("API_TOKEN")
-c=os.getenv("CHATID")
-h={"x-apisports-key":k}
+"""
+API-Football Diagnosis Script for Bothost
+Tests all critical endpoints for OUU scanner
+"""
+import os
+import requests
+import json
+from datetime import datetime, timedelta
 
-# Проверяем матчи на сегодня и вчера
-for date in ["2026-08-25","2026-08-24","2026-08-23"]:
- r=requests.get(f"https://v3.football.api-sports.io/fixtures?date={date}",headers=h,timeout=15)
- d=r.json()
- print(f"Date {date}: {len(d.get('response',[]))} matches")
- if d.get("response"):
-  m=d["response"][0]
-  print(f"  First: {m['teams']['home']['name']} vs {m['teams']['away']['name']} ({m['league']['name']})")
-  # Проверяем статистику
-  fid=m["fixture"]["id"]
-  r2=requests.get(f"https://v3.football.api-sports.io/fixtures/statistics?fixture={fid}",headers=h,timeout=15)
-  d2=r2.json()
-  print(f"  Stats: {len(d2.get('response',[]))} teams")
-  if d2.get("response"):
-   for ts in d2["response"]:
-    print(f"    {ts['team']['name']} stats:")
-    for s in ts.get("statistics",[]):
-     if s["type"] in ["Shots on Goal","Total Shots","Corner Kicks","Fouls"]:
-      print(f"      {s['type']}: {s['value']}")
-  break
+API_KEY = os.getenv("APIFOOTBALL", "a1567f0073f6c6e6ae70")
+BASE_URL = "https://v3.football.api-sports.io"
+HEADERS = {"x-apisports-key": API_KEY}
 
-# Telegram test
-if t and c:
- requests.post("https://api.telegram.org/bot"+t+"/sendMessage",json={"chat_id":c,"text":"API test done"},timeout=10)
- print("TG sent")
+def api_call(endpoint, params=None):
+    """Make API call and return parsed response"""
+    url = f"{BASE_URL}/{endpoint}"
+    try:
+        resp = requests.get(url, headers=HEADERS, params=params, timeout=15)
+        remaining = resp.headers.get('x-ratelimit-requests-remaining', 'N/A')
+        print(f"\n📡 {endpoint} | params={params}")
+        print(f"   Status: {resp.status_code} | Remaining today: {remaining}")
+        data = resp.json()
+        print(f"   Results: {data.get('results', 0)}")
+        if data.get('errors'):
+            print(f"   ⚠️ Errors: {data['errors']}")
+        return data
+    except Exception as e:
+        print(f"   ❌ Exception: {e}")
+        return None
+
+def main():
+    today = datetime.now().strftime("%Y-%m-%d")
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    
+    print("=" * 60)
+    print("API-FOOTBALL DIAGNOSIS")
+    print(f"Date: {today} | Key: {API_KEY[:8]}...")
+    print("=" * 60)
+    
+    # 1. Проверка ключа
+    print("\n--- 1. AUTH TEST ---")
+    status = api_call("status")
+    
+    # 2. Список лиг (найдём популярные ID)
+    print("\n--- 2. LEAGUES (top 5) ---")
+    leagues = api_call("leagues", {"season": 2026, "current": "true"})
+    if leagues and leagues.get('response'):
+        for l in leagues['response'][:5]:
+            print(f"   {l['league']['id']}: {l['league']['name']} ({l['country']['name']})")
+    
+    # 3. Матчи за сегодня (все статусы)
+    print("\n--- 3. FIXTURES BY DATE ---")
+    fixtures_today = api_call("fixtures", {"date": today})
+    count_today = fixtures_today.get('results', 0) if fixtures_today else 0
+    print(f"   Total fixtures today: {count_today}")
+    
+    # 4. Live матчи (все)
+    print("\n--- 4. LIVE FIXTURES (all) ---")
+    live_all = api_call("fixtures", {"live": "all"})
+    count_live = live_all.get('results', 0) if live_all else 0
+    print(f"   Live matches now: {count_live}")
+    
+    # 5. Live матчи по конкретным лигам (АПЛ=39, Ла Лига=140, Серия А=135)
+    print("\n--- 5. LIVE BY LEAGUE IDs ---")
+    live_leagues = api_call("fixtures", {"live": "39-140-135-61-78-94"})
+    count_ll = live_leagues.get('results', 0) if live_leagues else 0
+    print(f"   Live in top leagues: {count_ll}")
+    
+    # 6. Матчи за вчера (завершённые — для теста статистики)
+    print("\n--- 6. YESTERDAY'S FIXTURES ---")
+    fixtures_yest = api_call("fixtures", {"date": yesterday, "status": "FT"})
+    count_yest = fixtures_yest.get('results', 0) if fixtures_yest else 0
+    print(f"   Finished yesterday: {count_yest}")
+    
+    # 7. Статистика по завершённому матчу (берём первый из вчерашних)
+    print("\n--- 7. FIXTURE STATISTICS ---")
+    if fixtures_yest and fixtures_yest.get('response') and count_yest > 0:
+        first_id = fixtures_yest['response'][0]['fixture']['id']
+        print(f"   Testing with fixture_id={first_id}")
+        stats = api_call("fixtures/statistics", {"fixture": first_id})
+        if stats and stats.get('response'):
+            print(f"   Stats teams: {len(stats['response'])}")
+            for team_stats in stats['response']:
+                team_name = team_stats['team']['name']
+                shots = next((s['value'] for s in team_stats['statistics'] if s['type'] == 'Shots on Goal'), 'N/A')
+                corners = next((s['value'] for s in team_stats['statistics'] if s['type'] == 'Corner Kicks'), 'N/A')
+                print(f"   {team_name}: Shots={shots}, Corners={corners}")
+    else:
+        print("   ⚠️ No finished fixtures to test statistics")
+    
+    # 8. События матча (голы, карточки)
+    print("\n--- 8. FIXTURE EVENTS ---")
+    if fixtures_yest and fixtures_yest.get('response') and count_yest > 0:
+        first_id = fixtures_yest['response'][0]['fixture']['id']
+        events = api_call("fixtures/events", {"fixture": first_id})
+        if events:
+            print(f"   Events count: {events.get('results', 0)}")
+    
+    # 9. Составы (lineups)
+    print("\n--- 9. FIXTURE LINEUPS ---")
+    if fixtures_yest and fixtures_yest.get('response') and count_yest > 0:
+        first_id = fixtures_yest['response'][0]['fixture']['id']
+        lineups = api_call("fixtures/lineups", {"fixture": first_id})
+        if lineups:
+            print(f"   Lineups count: {lineups.get('results', 0)}")
+    
+    # 10. Standings (для контекста)
+    print("\n--- 10. STANDINGS (Premier League) ---")
+    standings = api_call("standings", {"league": 39, "season": 2026})
+    if standings and standings.get('response'):
+        print(f"   Groups: {len(standings['response'])}")
+    
+    print("\n" + "=" * 60)
+    print("DIAGNOSIS COMPLETE")
+    print("=" * 60)
+
+if __name__ == "__main__":
+    main()
