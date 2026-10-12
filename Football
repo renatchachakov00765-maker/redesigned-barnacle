@@ -1,354 +1,333 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-sstats_explorer.py
-Диагностика API sstats.net: эндпоинты, структура ответов, доступные метрики.
-Результаты сохраняются в /app/data/sstats_*.json
-"""
-
-import requests
-import json
-import os
-import time
+import asyncio
+import logging
 from datetime import datetime, timedelta
+from typing import List, Dict, Optional
 
-# ==================== КОНФИГ ====================
-API_KEY = os.getenv("SSTATSKEY", "1zbc100xzmi2lnsq")
-BASE_URLS = [
-    "https://sstats.net",
-    "https://api.sstats.net",
-    "https://www.sstats.net",
-]
-DATA_DIR = os.getenv("DATA_DIR", "/app/data")
-os.makedirs(DATA_DIR, exist_ok=True)
+import aiohttp
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-TODAY = datetime.now().strftime("%Y-%m-%d")
-YESTERDAY = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+# ========== НАСТРОЙКИ ==========
+BOT_TOKEN = "ВСТАВЬ_ТОКЕН_БОТА"
+CHAT_ID = "ВСТАВЬ_CHAT_ID"
 
-# Заголовки для разных способов авторизации
-HEADERS_KEY = {
-    "X-API-Key": API_KEY,
-    "Authorization": f"Bearer {API_KEY}",
-    "api-key": API_KEY,
-    "Content-Type": "application/json",
-    "User-Agent": "sstats-explorer/1.0"
-}
+# Фильтры стратегии
+HOME_WIN_MIN = 1.35
+HOME_WIN_MAX = 1.75
+AWAY_WIN_MIN = 1.90
+HOME_SCORED_MIN = 4  # из 5 матчей
+HOME_AVG_GOALS_MIN = 1.5
+AWAY_CONCEDED_MIN = 4  # из 5 матчей
+AWAY_AVG_CONCEDED_MIN = 1.3
 
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "sstats-explorer/1.0"})
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-results_log = []
 
-# ==================== УТИЛИТЫ ====================
+# ========== SSTATS API ==========
+class SstatsAPI:
+    BASE_URL = "https://api.sstats.net"
+    
+    def __init__(self):
+        self.session: Optional[aiohttp.ClientSession] = None
+    
+    async def __aenter__(self):
+        self.session = aiohttp.ClientSession()
+        return self
+    
+    async def __aexit__(self, *args):
+        if self.session:
+            await self.session.close()
+    
+    async def get_today_matches(self) -> List[Dict]:
+        """Получить матчи на сегодня"""
+        today = datetime.now().strftime("%Y-%m-%d")
+        url = f"{self.BASE_URL}/games/list"
+        params = {
+            'date': today,
+            'limit': 1000
+        }
+        
+        async with self.session.get(url, params=params) as response:
+            if response.status != 200:
+                logger.error(f"Sstats error: {response.status}")
+                return []
+            data = await response.json()
+        
+        return data if isinstance(data, list) else data.get('games', data.get('matches', []))
+    
+    async def get_match(self, match_id: str) -> Optional[Dict]:
+        """Получить полную информацию о матче"""
+        url = f"{self.BASE_URL}/games/{match_id}"
+        
+        async with self.session.get(url) as response:
+            if response.status != 200:
+                return None
+            return await response.json()
+    
+    async def get_last_games_stats(self, team_id: int, venue: str = 'all') -> Optional[Dict]:
+        """Получить статистику последних матчей команды"""
+        url = f"{self.BASE_URL}/games/last-games-stats"
+        params = {
+            'team': team_id,
+            'venue': venue,
+            'limit': 5
+        }
+        
+        async with self.session.get(url, params=params) as response:
+            if response.status != 200:
+                return None
+            return await response.json()
 
-def save_json(name, data):
-    path = os.path.join(DATA_DIR, f"sstats_{name}.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    print(f"💾 Сохранено: {path}")
-    return path
 
-def log_result(test_name, url, status, data, error=None):
-    entry = {
-        "test": test_name,
-        "url": url,
-        "status": status,
-        "timestamp": datetime.now().isoformat(),
-        "data_preview": str(data)[:500] if data else None,
-        "error": str(error) if error else None
-    }
-    results_log.append(entry)
-    status_icon = "✅" if status == 200 else "⚠️" if status else "❌"
-    print(f"{status_icon} [{test_name}] HTTP {status} | {url}")
-    if error:
-        print(f"   Ошибка: {error}")
+# ========== ФИЛЬТР МАТЧЕЙ ==========
+class MatchFilter:
+    def __init__(self, api: SstatsAPI):
+        self.api = api
+    
+    async def check_match(self, match: Dict) -> tuple:
+        """Проверить матч по всем фильтрам"""
+        match_id = match.get('Id') or match.get('id')
+        home_id = match.get('HomeTeamId') or match.get('homeTeamId')
+        away_id = match.get('AwayTeamId') or match.get('awayTeamId')
+        
+        if not all([match_id, home_id, away_id]):
+            return False, "Нет ID"
+        
+        # Коэффициенты из списка матчей
+        odds = match.get('Odds', {})
+        home_odds = odds.get('1') or odds.get('Home')
+        away_odds = odds.get('2') or odds.get('Away')
+        
+        # Если нет в списке, запрашиваем детально
+        if not home_odds or not away_odds:
+            details = await self.api.get_match(match_id)
+            if details:
+                odds = details.get('Odds', {})
+                home_odds = odds.get('1') or odds.get('Home')
+                away_odds = odds.get('2') or odds.get('Away')
+        
+        if not home_odds or not (HOME_WIN_MIN <= home_odds <= HOME_WIN_MAX):
+            return False, f"Кэф хозяев {home_odds} вне {HOME_WIN_MIN}-{HOME_WIN_MAX}"
+        
+        if not away_odds or away_odds < AWAY_WIN_MIN:
+            return False, f"Кэф гостей {away_odds} < {AWAY_WIN_MIN}"
+        
+        # Статистика хозяев дома
+        home_stats = await self.api.get_last_games_stats(home_id, venue='home')
+        if not home_stats:
+            return False, "Нет статистики хозяев"
+        
+        home_matches = home_stats.get('Games', home_stats.get('games', []))[:5]
+        if len(home_matches) < 5:
+            return False, "Мало матчей хозяев"
+        
+        scored = 0
+        total_goals = 0
+        for m in home_matches:
+            home_score = m.get('HomeScore', m.get('homeScore', 0))
+            if home_score > 0:
+                scored += 1
+            total_goals += home_score
+        
+        avg_goals = total_goals / len(home_matches)
+        
+        if scored < HOME_SCORED_MIN:
+            return False, f"Хозяева забили в {scored}/5"
+        
+        if avg_goals < HOME_AVG_GOALS_MIN:
+            return False, f"Средние голы {avg_goals:.2f} < {HOME_AVG_GOALS_MIN}"
+        
+        # Статистика гостей на выезде
+        away_stats = await self.api.get_last_games_stats(away_id, venue='away')
+        if not away_stats:
+            return False, "Нет статистики гостей"
+        
+        away_matches = away_stats.get('Games', away_stats.get('games', []))[:5]
+        if len(away_matches) < 5:
+            return False, "Мало матчей гостей"
+        
+        conceded = 0
+        total_conceded = 0
+        for m in away_matches:
+            home_score = m.get('HomeScore', m.get('homeScore', 0))
+            if home_score > 0:
+                conceded += 1
+            total_conceded += home_score
+        
+        avg_conceded = total_conceded / len(away_matches)
+        
+        if conceded < AWAY_CONCEDED_MIN:
+            return False, f"Гости пропустили в {conceded}/5"
+        
+        if avg_conceded < AWAY_AVG_CONCEDED_MIN:
+            return False, f"Средние пропущенные {avg_conceded:.2f} < {AWAY_AVG_CONCEDED_MIN}"
+        
+        return True, {
+            'home_odds': home_odds,
+            'away_odds': away_odds,
+            'home_scored': scored,
+            'home_avg': round(avg_goals, 2),
+            'away_conceded': conceded,
+            'away_avg': round(avg_conceded, 2)
+        }
 
-def safe_request(method, url, **kwargs):
-    try:
-        resp = SESSION.request(method, url, timeout=15, **kwargs)
-        try:
-            data = resp.json()
-        except Exception:
-            data = {"raw_text": resp.text[:1000]}
-        return resp.status_code, data, None
-    except Exception as e:
-        return None, None, e
 
-# ==================== ТЕСТЫ ====================
-
-def test_base_urls():
-    """Тест 1: Просто проверяем, жив ли домен."""
-    print("\n🔎 ТЕСТ 1: Базовые URL (GET /)")
-    for base in BASE_URLS:
-        status, data, err = safe_request("GET", base)
-        log_result(f"base_{base.replace('https://','')}", base, status, data, err)
-        time.sleep(0.5)
-
-def test_api_versions():
-    """Тест 2: Ищем /api, /api/v1, /v1 и т.д."""
-    print("\n🔎 ТЕСТ 2: Версии API")
-    paths = ["/api", "/api/v1", "/v1", "/v2", "/api/v2", "/rest", "/rest/v1"]
-    for base in BASE_URLS:
-        for path in paths:
-            url = f"{base}{path}"
-            status, data, err = safe_request("GET", url)
-            log_result(f"api_ver_{path.replace('/','_')}", url, status, data, err)
-            time.sleep(0.3)
-
-def test_auth_methods():
-    """Тест 3: Разные способы передачи ключа."""
-    print("\n🔎 ТЕСТ 3: Способы авторизации")
+# ========== TELEGRAM БОТ ==========
+class BetBot:
+    def __init__(self):
+        self.api = SstatsAPI()
+        self.filter = MatchFilter(self.api)
+        self.scheduler = AsyncIOScheduler()
+        self.found_matches: List[Dict] = []
     
-    # Пробуем наиболее вероятные базовые пути
-    test_paths = ["/api/v1/fixtures", "/api/v1/matches", "/api/v1/live", "/api/v1/leagues"]
-    
-    for base in BASE_URLS:
-        for path in test_paths:
-            # 3a: Query param ?key=...
-            url = f"{base}{path}?key={API_KEY}&date={TODAY}"
-            status, data, err = safe_request("GET", url)
-            log_result(f"auth_query_{path.replace('/','_')}", url, status, data, err)
-            
-            # 3b: Header X-API-Key
-            url = f"{base}{path}?date={TODAY}"
-            status, data, err = safe_request("GET", url, headers=HEADERS_KEY)
-            log_result(f"auth_header_{path.replace('/','_')}", url, status, data, err)
-            
-            # 3c: Query param ?api_key=...
-            url = f"{base}{path}?api_key={API_KEY}&date={TODAY}"
-            status, data, err = safe_request("GET", url)
-            log_result(f"auth_apikey_{path.replace('/','_')}", url, status, data, err)
-            
-            # 3d: Query param ?token=...
-            url = f"{base}{path}?token={API_KEY}&date={TODAY}"
-            status, data, err = safe_request("GET", url)
-            log_result(f"auth_token_{path.replace('/','_')}", url, status, data, err)
-            
-            time.sleep(0.3)
-
-def test_fixtures_endpoints():
-    """Тест 4: Поиск матчей — разные варианты путей и параметров."""
-    print("\n🔎 ТЕСТ 4: Эндпоинты матчей (fixtures/matches/games)")
-    
-    path_variants = [
-        "/api/v1/fixtures",
-        "/api/v1/matches",
-        "/api/v1/games",
-        "/api/v1/schedule",
-        "/api/v1/events",
-        "/v1/fixtures",
-        "/fixtures",
-    ]
-    
-    param_sets = [
-        {"date": TODAY},
-        {"date": YESTERDAY, "status": "FT"},
-        {"live": "all"},
-        {"live": "true"},
-        {"status": "LIVE"},
-        {"league": "39", "season": "2026"},  # АПЛ
-    ]
-    
-    for base in BASE_URLS:
-        for path in path_variants:
-            for params in param_sets:
-                # Пробуем с ключом в query (самый распространённый способ)
-                p = params.copy()
-                p["key"] = API_KEY
-                url = f"{base}{path}"
-                status, data, err = safe_request("GET", url, params=p)
-                test_name = f"fixtures_{path.replace('/','_')}_{'_'.join(f'{k}-{v}' for k,v in params.items())}"
-                log_result(test_name[:80], url + "?" + "&".join(f"{k}={v}" for k,v in p.items()), status, data, err)
-                time.sleep(0.3)
-
-def test_statistics_endpoints():
-    """Тест 5: Статистика конкретного матча (нужен fixture_id)."""
-    print("\n🔎 ТЕСТ 5: Статистика матча")
-    
-    # Используем «фиктивный» ID, чтобы увидеть структуру ошибки/ответа
-    dummy_id = "123456"
-    
-    stat_paths = [
-        f"/api/v1/fixtures/statistics/{dummy_id}",
-        f"/api/v1/statistics/fixture/{dummy_id}",
-        f"/api/v1/matches/{dummy_id}/statistics",
-        f"/api/v1/fixtures/{dummy_id}/stats",
-        f"/api/v1/events/{dummy_id}/statistics",
-        f"/v1/fixtures/statistics",
-        f"/statistics/{dummy_id}",
-    ]
-    
-    for base in BASE_URLS:
-        for path in stat_paths:
-            url = f"{base}{path}?key={API_KEY}"
-            status, data, err = safe_request("GET", url)
-            log_result(f"stats_{path.replace('/','_')[:60]}", url, status, data, err)
-            time.sleep(0.3)
-
-def test_leagues_teams():
-    """Тест 6: Лиги и команды."""
-    print("\n🔎 ТЕСТ 6: Лиги и команды")
-    
-    paths = [
-        "/api/v1/leagues",
-        "/api/v1/teams",
-        "/api/v1/countries",
-        "/api/v1/seasons",
-        "/v1/leagues",
-        "/leagues",
-    ]
-    
-    for base in BASE_URLS:
-        for path in paths:
-            url = f"{base}{path}?key={API_KEY}"
-            status, data, err = safe_request("GET", url)
-            log_result(f"meta_{path.replace('/','_')}", url, status, data, err)
-            time.sleep(0.3)
-
-def test_odds_endpoints():
-    """Тест 7: Коэффициенты (если доступны)."""
-    print("\n🔎 ТЕСТ 7: Коэффициенты / odds")
-    
-    paths = [
-        "/api/v1/odds",
-        "/api/v1/odds/live",
-        "/api/v1/betting/odds",
-        "/v1/odds",
-    ]
-    
-    for base in BASE_URLS:
-        for path in paths:
-            url = f"{base}{path}?key={API_KEY}&date={TODAY}"
-            status, data, err = safe_request("GET", url)
-            log_result(f"odds_{path.replace('/','_')}", url, status, data, err)
-            time.sleep(0.3)
-
-def test_post_methods():
-    """Тест 8: Пробуем POST (некоторые API требуют POST для сложных фильтров)."""
-    print("\n🔎 ТЕСТ 8: POST-запросы")
-    
-    post_bodies = [
-        {"key": API_KEY, "date": TODAY},
-        {"api_key": API_KEY, "leagues": [39, 140, 135]},
-        {"token": API_KEY, "live": True},
-    ]
-    
-    post_paths = ["/api/v1/fixtures", "/api/v1/matches", "/v1/fixtures"]
-    
-    for base in BASE_URLS:
-        for path in post_paths:
-            for body in post_bodies:
-                url = f"{base}{path}"
-                status, data, err = safe_request("POST", url, json=body)
-                log_result(f"post_{path.replace('/','_')}_{list(body.keys())[0]}", url, status, data, err)
-                time.sleep(0.3)
-
-def test_inplay_live():
-    """Тест 9: Live / in-play."""
-    print("\n🔎 ТЕСТ 9: Live-матчи")
-    
-    paths = [
-        "/api/v1/fixtures/live",
-        "/api/v1/live",
-        "/api/v1/inplay",
-        "/api/v1/matches/live",
-        "/v1/live",
-        "/live",
-    ]
-    
-    for base in BASE_URLS:
-        for path in paths:
-            url = f"{base}{path}?key={API_KEY}"
-            status, data, err = safe_request("GET", url)
-            log_result(f"live_{path.replace('/','_')}", url, status, data, err)
-            time.sleep(0.3)
-
-def test_head2h():
-    """Тест 10: H2H / история встреч."""
-    print("\n🔎 ТЕСТ 10: H2H / head2head")
-    
-    # Фиктивные ID команд
-    h2h_paths = [
-        "/api/v1/fixtures/headtohead?h2h=33-34",
-        "/api/v1/h2h?teams=33-34",
-        "/api/v1/matches/h2h?team1=33&team2=34",
-    ]
-    
-    for base in BASE_URLS:
-        for path in h2h_paths:
-            url = f"{base}{path}&key={API_KEY}"
-            status, data, err = safe_request("GET", url)
-            log_result(f"h2h_{path.replace('/','_')[:50]}", url, status, data, err)
-            time.sleep(0.3)
-
-# ==================== ОТЧЁТ ====================
-
-def generate_report():
-    """Финальный отчёт + сохранение полного лога."""
-    print("\n" + "="*60)
-    print("📊 ФИНАЛЬНЫЙ ОТЧЁТ")
-    print("="*60)
-    
-    successful = [r for r in results_log if r["status"] == 200]
-    failed = [r for r in results_log if r["status"] != 200]
-    errors = [r for r in results_log if r["error"]]
-    
-    print(f"Всего тестов: {len(results_log)}")
-    print(f"✅ HTTP 200: {len(successful)}")
-    print(f"⚠️  Остальные статусы: {len(failed)}")
-    print(f"❌ Ошибки соединения: {len(errors)}")
-    
-    # Ищем тесты, где вернулся непустой JSON с 'response' или 'data' или списком
-    promising = []
-    for r in results_log:
-        if r["status"] == 200 and r["data_preview"]:
-            preview = r["data_preview"]
-            if len(preview) > 50 and not preview.startswith("<"):
-                promising.append(r)
-    
-    print(f"\n🎯 Перспективные ответы (200 + непустой JSON): {len(promising)}")
-    for p in promising[:10]:
-        print(f"   → {p['test']}: {p['url']}")
-        print(f"     Превью: {p['data_preview'][:120]}...")
-    
-    # Сохраняем полный лог
-    save_json("full_diagnosis_log", results_log)
-    
-    # Сохраняем «сводку» только успешных
-    save_json("successful_endpoints", {
-        "count": len(successful),
-        "endpoints": [
-            {"test": r["test"], "url": r["url"], "preview": r["data_preview"][:200]}
-            for r in successful
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /start"""
+        keyboard = [
+            [InlineKeyboardButton("🔍 Сканировать", callback_data='scan')],
+            [InlineKeyboardButton("📋 Найденные", callback_data='list')],
+            [InlineKeyboardButton("⚙️ Фильтры", callback_data='filters')],
         ]
-    })
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            '🤖 Бот стратегии "Гол фаворита дома"\n\n'
+            f'🏠 Кэф хозяев: {HOME_WIN_MIN}–{HOME_WIN_MAX}\n'
+            f'✈️ Кэф гостей: ≥{AWAY_WIN_MIN}\n'
+            f'⚽ Хозяева забивали: {HOME_SCORED_MIN}/5\n'
+            f'🥅 Гости пропускали: {AWAY_CONCEDED_MIN}/5',
+            reply_markup=reply_markup
+        )
     
-    print("\n📁 Все файлы сохранены в:", DATA_DIR)
-    print("   - sstats_full_diagnosis_log.json")
-    print("   - sstats_successful_endpoints.json")
-    print("   - И все отдельные *.json для каждого теста")
+    async def scan(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Сканирование матчей"""
+        query = update.callback_query
+        await query.answer()
+        await query.edit_message_text("🔍 Сканирую матчи на сегодня...")
+        
+        async with self.api:
+            matches = await self.api.get_today_matches()
+            found = []
+            
+            for match in matches:
+                is_valid, result = await self.filter.check_match(match)
+                if is_valid:
+                    match['stats'] = result
+                    found.append(match)
+                    await self._notify(context, match)
+            
+            self.found_matches = found
+        
+        await query.edit_message_text(
+            f"✅ Сканирование завершено\n\n"
+            f"Проверено матчей: {len(matches)}\n"
+            f"Подходит: {len(found)}"
+        )
+    
+    async def list_matches(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Список найденных"""
+        query = update.callback_query
+        await query.answer()
+        
+        if not self.found_matches:
+            await query.edit_message_text("Пусто. Запусти сканирование.")
+            return
+        
+        text = "📋 Найденные матчи:\n\n"
+        for i, m in enumerate(self.found_matches, 1):
+            home = m.get('HomeTeam', m.get('homeTeam', '?'))
+            away = m.get('AwayTeam', m.get('awayTeam', '?'))
+            if isinstance(home, dict):
+                home = home.get('Name', home.get('name', '?'))
+            if isinstance(away, dict):
+                away = away.get('Name', away.get('name', '?'))
+            text += f"{i}. {home} — {away}\n"
+        
+        keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data='start')]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    async def filters_info(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Информация о фильтрах"""
+        query = update.callback_query
+        await query.answer()
+        
+        text = (
+            "⚙️ Текущие фильтры:\n\n"
+            f"Кэф хозяев: {HOME_WIN_MIN}–{HOME_WIN_MAX}\n"
+            f"Кэф гостей: ≥{AWAY_WIN_MIN}\n"
+            f"Хозяева забивали: {HOME_SCORED_MIN}/5 матчей\n"
+            f"Средние голы хозяев: ≥{HOME_AVG_GOALS_MIN}\n"
+            f"Гости пропускали: {AWAY_CONCEDED_MIN}/5 матчей\n"
+            f"Средние пропущенные: ≥{AWAY_AVG_CONCEDED_MIN}"
+        )
+        
+        keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data='start')]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    async def _notify(self, context: ContextTypes.DEFAULT_TYPE, match: Dict):
+        """Уведомление о подходящем матче"""
+        home = match.get('HomeTeam', match.get('homeTeam', '?'))
+        away = match.get('AwayTeam', match.get('awayTeam', '?'))
+        if isinstance(home, dict):
+            home = home.get('Name', home.get('name', '?'))
+        if isinstance(away, dict):
+            away = away.get('Name', away.get('name', '?'))
+        
+        stats = match.get('stats', {})
+        
+        text = (
+            f"⚽ Подходящий матч!\n\n"
+            f"🏠 {home} — {away} ✈️\n\n"
+            f"📊 Кэфы: П1 {stats.get('home_odds')} | П2 {stats.get('away_odds')}\n"
+            f"⚽ Хозяева забивали: {stats.get('home_scored')}/5 (ср. {stats.get('home_avg')})\n"
+            f"🥅 Гости пропускали: {stats.get('away_conceded')}/5 (ср. {stats.get('away_avg')})"
+        )
+        
+        await context.bot.send_message(chat_id=CHAT_ID, text=text)
+    
+    def setup_scheduler(self, application: Application):
+        """Автосканирование каждые 30 минут"""
+        self.scheduler.add_job(
+            self._auto_scan, 'interval', minutes=30, args=[application]
+        )
+        self.scheduler.start()
+    
+    async def _auto_scan(self, application: Application):
+        """Фоновое сканирование"""
+        logger.info("Auto-scan started")
+        async with self.api:
+            matches = await self.api.get_today_matches()
+            for match in matches:
+                is_valid, result = await self.filter.check_match(match)
+                if is_valid and not self._already_found(match):
+                    match['stats'] = result
+                    self.found_matches.append(match)
+                    await self._notify(application.bot, match)
+    
+    def _already_found(self, match: Dict) -> bool:
+        """Проверка дубликатов"""
+        match_id = match.get('Id') or match.get('id')
+        return any((m.get('Id') or m.get('id')) == match_id for m in self.found_matches)
 
-# ==================== MAIN ====================
 
-if __name__ == "__main__":
-    print("="*60)
-    print("🚀 SSTATS.NET API EXPLORER")
-    print(f"📅 Дата теста: {TODAY}")
-    print(f"🔑 Ключ: {API_KEY[:8]}...{API_KEY[-4:]}")
-    print(f"📂 Выходная директория: {DATA_DIR}")
-    print("="*60)
+# ========== ЗАПУСК ==========
+def main():
+    application = Application.builder().token(BOT_TOKEN).build()
+    bot = BetBot()
     
-    test_base_urls()
-    test_api_versions()
-    test_auth_methods()
-    test_fixtures_endpoints()
-    test_statistics_endpoints()
-    test_leagues_teams()
-    test_odds_endpoints()
-    test_post_methods()
-    test_inplay_live()
-    test_head2h()
+    application.add_handler(CommandHandler("start", bot.start))
+    application.add_handler(CallbackQueryHandler(bot.scan, pattern='^scan$'))
+    application.add_handler(CallbackQueryHandler(bot.list_matches, pattern='^list$'))
+    application.add_handler(CallbackQueryHandler(bot.filters_info, pattern='^filters$'))
+    application.add_handler(CallbackQueryHandler(bot.start, pattern='^start$'))
     
-    generate_report()
-    
-    print("\n✅ Диагностика завершена. Забери файлы из папки data.")
+    bot.setup_scheduler(application)
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == '__main__':
+    main()
