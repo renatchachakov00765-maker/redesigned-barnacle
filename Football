@@ -1,3 +1,4 @@
+
 import os
 import logging
 import requests
@@ -19,7 +20,15 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
-# --- Получить список матчей на сегодня ---
+# --- Безопасное извлечение имени ---
+def get_name(obj, default="Неизвестно"):
+    if isinstance(obj, dict):
+        return obj.get("name", default)
+    elif isinstance(obj, str):
+        return obj
+    return default
+
+# --- Получить список матчей ---
 def fetch_events_sync():
     today = datetime.now().strftime("%Y-%m-%d")
     url = f"{API_BASE}/events/"
@@ -32,7 +41,7 @@ def fetch_events_sync():
     except Exception as e:
         return {"error": str(e)}
 
-# --- Получить коэффициенты на ОЗ (BTTS Yes) ---
+# --- Получить коэффициенты на ОЗ ---
 def fetch_btts_odds_sync():
     url = f"{API_BASE}/odds/"
     params = {"market": "btts", "limit": 200}
@@ -49,46 +58,50 @@ async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 Запрашиваю матчи и коэффициенты на ОЗ...")
 
     try:
-        # Используем to_thread, чтобы запросы не вешали бота
         events = await asyncio.to_thread(fetch_events_sync)
         if isinstance(events, dict) and "error" in events:
             await update.message.reply_text(f"❌ Ошибка API (события):\n{events['error']}")
             return
-        if not events:
-            await update.message.reply_text("😕 На сегодня нет предстоящих матчей.")
+        if not events or not isinstance(events, list):
+            await update.message.reply_text("😕 На сегодня нет предстоящих матчей (или неверный формат).")
             return
 
         odds_list = await asyncio.to_thread(fetch_btts_odds_sync)
         if isinstance(odds_list, dict) and "error" in odds_list:
             await update.message.reply_text(f"❌ Ошибка API (коэфы):\n{odds_list['error']}")
             return
-        if not odds_list:
+        if not odds_list or not isinstance(odds_list, list):
             await update.message.reply_text("😕 Сегодня нет коэффициентов на ОЗ.")
             return
 
-        # Защита от неожиданного формата
-        if isinstance(odds_list, dict):
-            odds_list = odds_list.get("results", [])
-
+        # Собираем коэффициенты в словарь: event_id -> макс. кэф
         odds_map = {}
         for row in odds_list:
             if not isinstance(row, dict): continue
-            eid = row.get("event_id")
-            price = row.get("decimal_odds")
-            if eid and price:
-                if eid not in odds_map or price > odds_map[eid]:
-                    odds_map[eid] = price
+            
+            # Пробуем разные варианты названий полей
+            eid = row.get("event_id") or row.get("event") or row.get("match_id")
+            price = row.get("decimal_odds") or row.get("odds") or row.get("price") or row.get("value")
+            
+            try:
+                if eid and price:
+                    price = float(price)
+                    if eid not in odds_map or price > odds_map[eid]:
+                        odds_map[eid] = price
+            except (ValueError, TypeError):
+                pass
 
         msg = "📊 <b>Матчи с коэффициентом на ОЗ «Да»:</b>\n\n"
         count = 0
         for event in events:
             if not isinstance(event, dict): continue
-            eid = event.get("id")
+            
+            eid = event.get("id") or event.get("event_id")
             if eid not in odds_map: continue
 
-            home = event.get("home_team", {}).get("name", "Неизвестно")
-            away = event.get("away_team", {}).get("name", "Неизвестно")
-            league = event.get("league", {}).get("name", "Лига не указана")
+            home = get_name(event.get("home_team"), "Хозяева")
+            away = get_name(event.get("away_team"), "Гости")
+            league = get_name(event.get("league"), "Лига не указана")
             odds = odds_map[eid]
 
             msg += f"🟢 <b>{home} — {away}</b>\n   🏆 {league}\n   💰 Кэф ОЗ: {odds:.2f}\n\n"
@@ -98,13 +111,12 @@ async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 break
 
         if count == 0:
-            await update.message.reply_text("😕 Не найдено матчей, где есть и событие, и коэффициент.")
+            await update.message.reply_text("😕 Не найдено матчей, где совпали ID события и коэффициента.")
         else:
             await update.message.reply_text(msg, parse_mode="HTML")
 
     except Exception as e:
-        # Если что-то упало, бот покажет вам точную ошибку
-        await update.message.reply_text(f"❌ Внутренняя ошибка бота:\n<code>{repr(e)}</code>", parse_mode="HTML")
+        await update.message.reply_text(f"❌ Ошибка парсинга:\n<code>{repr(e)}</code>", parse_mode="HTML")
 
 # --- Запуск ---
 def main():
@@ -115,7 +127,7 @@ def main():
     app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("⚽ Привет! Отправь /scan.")))
     app.add_handler(CommandHandler("scan", scan_matches))
     
-    logger.info("Bot started (Bzzoiro debug mode)")
+    logger.info("Bot started (Bzzoiro robust mode)")
     app.run_polling()
 
 if __name__ == "__main__":
