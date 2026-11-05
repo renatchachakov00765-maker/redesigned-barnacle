@@ -2,7 +2,7 @@ import os
 import logging
 import requests
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -65,19 +65,36 @@ def fetch_1x2_odds_sync():
             except: pass
     return odds_map
 
+# --- ИСПРАВЛЕННАЯ СТАТИСТИКА (Через общий эндпоинт событий) ---
 def get_team_stats_sync(team_id):
-    data = fetch_data(f"{API_BASE}/teams/{team_id}/fixtures/", {"status": "finished", "limit": 10})
+    # Запрашиваем последние 20 матчей команды через общий список событий
+    data = fetch_data(f"{API_BASE}/events/", {"team_id": team_id, "limit": 20})
+    
     if isinstance(data, dict) and "error" in data: return None
     matches = data if isinstance(data, list) else []
-    if len(matches) < 5: return None
+    
+    # Оставляем только завершенные матчи
+    finished = []
+    for m in matches:
+        status = str(m.get("status") or "").lower()
+        if status in ["finished", "ft", "ended", "3", "after_penalties"] or m.get("finished") == True:
+            finished.append(m)
+            
+    if len(finished) < 5: 
+        return None # Если меньше 5 завершенных матчей, статистика невалидна
 
+    # Берем 10 последних
+    matches_to_analyze = finished[:10]
+    
     btts, scored_count, clean_count = 0, 0, 0
     goals_scored, goals_conceded = 0, 0
-    total_matches = len(matches)
+    total_matches = len(matches_to_analyze)
 
-    for m in matches:
+    for m in matches_to_analyze:
         hg = m.get("home_score") or m.get("homeScore") or 0
         ag = m.get("away_score") or m.get("awayScore") or 0
+        
+        # Определяем ID команд в матче
         h_id = m.get("home_team", {}).get("id") if isinstance(m.get("home_team"), dict) else m.get("home_team_id")
         a_id = m.get("away_team", {}).get("id") if isinstance(m.get("away_team"), dict) else m.get("away_team_id")
         
@@ -102,7 +119,7 @@ def get_team_stats_sync(team_id):
     }
 
 async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 Сканирую (поиск по статистике, без жесткого фильтра равности)...")
+    await update.message.reply_text("🔍 Сканирую (полная статистика через /events/)...")
 
     try:
         today = datetime.now().strftime("%Y-%m-%d")
@@ -148,9 +165,8 @@ async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             
             odds = btts_map[eid]
             if not (1.40 <= odds <= 2.10):
-                continue # Пропускаем молча, чтобы не засорять лог
+                continue
 
-            # --- Информация о кэфах 1X2 (без отсева) ---
             odds_str = "1X2 нет"
             if eid in x12_map and all(k in x12_map[eid] for k in ["home", "draw", "away"]):
                 oh, od, oa = x12_map[eid]["home"], x12_map[eid]["draw"], x12_map[eid]["away"]
@@ -165,13 +181,12 @@ async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             a_stats = await asyncio.to_thread(get_team_stats_sync, a_id)
             
             if not h_stats or not a_stats:
-                rejected.append(f"• {match_name}: API не дал историю матчей")
+                rejected.append(f"• {match_name}: нет 5+ завершенных матчей в API")
                 continue
 
             h_str = f"{h_stats['goals_scored']}-{h_stats['goals_conceded']} в {h_stats['total_matches']} матчах"
             a_str = f"{a_stats['goals_scored']}-{a_stats['goals_conceded']} в {a_stats['total_matches']} матчах"
             
-            # --- ЖЕСТКИЙ ФИЛЬТР ТОЛЬКО ПО СТАТИСТИКЕ ---
             if (h_stats["btts_pct"] < 50 or a_stats["btts_pct"] < 50 or 
                 h_stats["scored_count"] < 5 or a_stats["scored_count"] < 5 or 
                 h_stats["avg_total"] < 2.2 or a_stats["avg_total"] < 2.2):
@@ -196,13 +211,13 @@ async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             })
 
         if not results:
-            msg = "😕 <b>Подходящих матчей по статистике не найдено.</b>\n\n"
+            msg = "😕 <b>Подходящих матчей не найдено.</b>\n\n"
             if rejected:
                 msg += "📋 <b>Причины отсева (до 5):</b>\n" + "\n\n".join(rejected[:5])
             await update.message.reply_text(msg, parse_mode="HTML")
         else:
             results.sort(key=lambda x: x["score"], reverse=True)
-            msg = "📊 <b>Результаты анализа (по статистике):</b>\n\n"
+            msg = "📊 <b>Результаты анализа (статистика подтверждена):</b>\n\n"
             for r in results:
                 msg += f"🟢 <b>{r['match']}</b>\n"
                 msg += f"   ⏰ {r['time']} | 🏆 {r['league']}\n"
@@ -219,7 +234,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("⚽ Привет! Отправь /scan.")))
     app.add_handler(CommandHandler("scan", scan_matches))
-    logger.info("Bot started (Stats only, no equality filter)")
+    logger.info("Bot started (Robust Events Stats)")
     app.run_polling()
 
 if __name__ == "__main__":
