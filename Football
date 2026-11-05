@@ -2,7 +2,6 @@ import os
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from pathlib import Path
 
 import aiohttp
 from dotenv import load_dotenv
@@ -18,72 +17,76 @@ API_BASE = "https://api.sstats.net"
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger("btts-bot")
 
-# ---------- API-клиент ----------
+# ---------- API-клиент с обработкой ошибок и обходом блокировок ----------
 async def fetch_json(session: aiohttp.ClientSession, endpoint: str, params: dict = None):
     url = f"{API_BASE}{endpoint}"
     if params is None:
         params = {}
     if SSTATS_API_KEY:
         params["apikey"] = SSTATS_API_KEY
+    else:
+        return {"error": "Ключ SSTATS_API_KEY не найден в переменных окружения!"}
+        
+    # Прикидываемся браузером, чтобы избежать блокировок
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json"
+    }
         
     try:
-        async with session.get(url, params=params, timeout=30) as resp:
+        async with session.get(url, params=params, headers=headers, timeout=30) as resp:
+            text = await resp.text()
             if resp.status != 200:
-                logger.error(f"API error {endpoint}: HTTP {resp.status}")
-                return None
-            return await resp.json()
+                error_msg = f"HTTP {resp.status}: {text[:150]}"
+                logger.error(f"API error {endpoint}: {error_msg}")
+                return {"error": error_msg}
+            try:
+                return await resp.json()
+            except Exception:
+                return {"error": f"Ошибка парсинга JSON. Ответ сервера: {text[:150]}"}
     except Exception as e:
-        logger.error(f"API error {endpoint}: {e}")
-        return None
+        error_msg = f"Сеть/Таймаут: {repr(e)}"
+        logger.error(f"API error {endpoint}: {error_msg}")
+        return {"error": error_msg}
 
 # ---------- Парсинг коэффициентов ----------
 def extract_odds(game):
-    """Достает 1X2 и ОЗ из массива коэффициентов матча"""
     odds_1x2 = None
     odds_btts = None
     
-    # В спецификации odds лежит в game['odds'] (ApiSaGame)
     for market in game.get("odds", []):
         market_name = market.get("marketName", "").lower()
         
-        # Ищем 1X2
         if "1x2" in market_name or "match result" in market_name or "winner" in market_name:
-            prices = {p["name"].lower(): p["value"] for p in market.get("odds", []) if p.get("value")}
-            # Ищем домашнюю, ничью и гостевую
-            for k, v in prices.items():
-                if k in ["1", "home", "w1"]: odds_1x2 = odds_1x2 or {}
-                if k in ["x", "draw"]: odds_1x2 = odds_1x2 or {}
-                if k in ["2", "away", "w2"]: odds_1x2 = odds_1x2 or {}
-            
-            # Более надежный способ по индексам, если имена странные
-            if len(market.get("odds", [])) == 3:
+            prices = market.get("odds", [])
+            if len(prices) >= 3:
+                p_dict = {str(p.get("name", "")).lower(): p.get("value") for p in prices}
                 odds_1x2 = {
-                    "home": market["odds"][0]["value"],
-                    "draw": market["odds"][1]["value"],
-                    "away": market["odds"][2]["value"]
+                    "home": p_dict.get("1", p_dict.get("home", prices[0].get("value"))),
+                    "draw": p_dict.get("x", p_dict.get("draw", prices[1].get("value"))),
+                    "away": p_dict.get("2", p_dict.get("away", prices[2].get("value")))
                 }
                 
-        # Ищем ОЗ
         elif "btts" in market_name or "both teams" in market_name:
-            prices = {p["name"].lower(): p["value"] for p in market.get("odds", []) if p.get("value")}
-            for k, v in prices.items():
-                if "yes" in k or k == "1": odds_btts = v
-                if "no" in k or k == "2": pass # нам нужен только "Да"
+            prices = market.get("odds", [])
+            for p in prices:
+                p_name = str(p.get("name", "")).lower()
+                if "yes" in p_name or p_name == "1":
+                    odds_btts = p.get("value")
     
     return odds_1x2, odds_btts
 
 # ---------- Статистика команды ----------
 async def get_team_stats(session: aiohttp.ClientSession, team_id: int):
-    """Возвращает (btts_pct, scored, clean_sheets, avg_total) по последним 10 матчам"""
     data = await fetch_json(session, "/Games/list", {
         "Team": team_id, "Ended": "true", "Limit": 10
     })
-    if not data or "data" not in data:
+    if not data or "error" in data or "data" not in data:
         return None
 
     matches = data["data"]
     if len(matches) < 5:
-        return None # Мало данных
+        return None
 
     btts_count = 0
     scored_count = 0
@@ -91,19 +94,14 @@ async def get_team_stats(session: aiohttp.ClientSession, team_id: int):
     total_goals = 0
 
     for m in matches:
-        # Берем голы основного времени (FT)
         home_goals = m.get("homeFTResult") or 0
         away_goals = m.get("awayFTResult") or 0
-        total = home_goals + away_goals
-        total_goals += total
+        total_goals += (home_goals + away_goals)
 
-        # Определяем, забивала ли эта команда
         if m.get("homeTeam", {}).get("id") == team_id:
-            scored = home_goals
-            conceded = away_goals
+            scored, conceded = home_goals, away_goals
         else:
-            scored = away_goals
-            conceded = home_goals
+            scored, conceded = away_goals, home_goals
 
         if scored > 0 and conceded > 0: btts_count += 1
         if scored > 0: scored_count += 1
@@ -124,21 +122,24 @@ async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     async with aiohttp.ClientSession() as session:
         tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
         
-        # Получаем матчи на завтра
         data = await fetch_json(session, "/Games/list", {
             "Date": tomorrow, "TimeZone": 3, "Limit": 1000
         })
         
-        if not data or "data" not in data:
-            await update.message.reply_text("❌ Не удалось получить матчи. Проверьте API ключ.")
+        if not data or "error" in data:
+            err_text = data.get("error", "Неизвестная ошибка") if data else "Пустой ответ"
+            await update.message.reply_text(f"❌ Ошибка API:\n{err_text}")
+            return
+            
+        if "data" not in data:
+            await update.message.reply_text("❌ API вернул данные, но список матчей пуст (возможно, на завтра нет игр).")
             return
 
         matches = data["data"]
-        await update.message.reply_text(f"📅 Найдено {len(matches)} матчей. Проверяю статистику (первые 40 для экономии лимитов API)...")
+        await update.message.reply_text(f"📅 Найдено {len(matches)} матчей. Проверяю статистику (первые 40 для лимитов API)...")
 
         results = []
         
-        # Ограничиваем до 40 матчей, чтобы не превысить лимит запросов
         for m in matches[:40]:
             home_team = m.get("homeTeam", {})
             away_team = m.get("awayTeam", {})
@@ -149,33 +150,28 @@ async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
             odds_1x2, odds_btts = extract_odds(m)
             if not odds_1x2 or not odds_btts:
-                continue # Нет нужных коэффициентов
+                continue 
 
-            # Равность
             try:
                 raw_h, raw_d, raw_a = 1/odds_1x2["home"], 1/odds_1x2["draw"], 1/odds_1x2["away"]
                 total_p = raw_h + raw_d + raw_a
                 p_h, p_a = raw_h / total_p, raw_a / total_p
                 diff = abs(p_h - p_a) * 100
                 
-                # Жесткий фильтр равности
                 if diff > 30: continue
-            except (KeyError, ZeroDivisionError):
+            except (KeyError, ZeroDivisionError, TypeError):
                 continue
 
-            # Получаем статистику команд
             home_stats = await get_team_stats(session, home_id)
             away_stats = await get_team_stats(session, away_id)
             
             if not home_stats or not away_stats: continue
 
-            # Жесткие фильтры ОЗ
             if home_stats["btts_pct"] < 50 or away_stats["btts_pct"] < 50: continue
             if home_stats["scored"] < 5 or away_stats["scored"] < 5: continue
             if home_stats["clean_sheets"] > 5 and away_stats["clean_sheets"] > 5: continue
             if home_stats["avg_total"] < 2.2 or away_stats["avg_total"] < 2.2: continue
 
-            # Скоринг
             score = 0
             for b in (home_stats["btts_pct"], away_stats["btts_pct"]):
                 score += 15 if b >= 70 else 10 if b >= 60 else 5 if b >= 50 else 0
@@ -199,21 +195,18 @@ async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     "stats": f"ОЗ: {home_stats['btts_pct']:.0f}%/{away_stats['btts_pct']:.0f}% | Тотал: {avg:.1f}"
                 })
 
-        # Отправка результата
         if not results:
             await update.message.reply_text("😕 Подходящих матчей на завтра не найдено.")
         else:
-            # Сортируем по скорингу (от большего к меньшему)
             results.sort(key=lambda x: x["score"], reverse=True)
-            
-            msg = "📊 <b>Результаты сканирования на завтра:</b>\n\n"
+            msg = "📊 <b>Результаты сканирования:</b>\n\n"
             for r in results:
                 emoji = "🟢" if r["verdict"] == "SIGNAL" else "🟡"
                 msg += f"{emoji} <b>{r['match']}</b>\n"
                 msg += f"   Кэф ОЗ: {r['odds']} | Скоринг: {r['score']}\n"
                 msg += f"   {r['stats']}\n\n"
             
-            msg += "⚠️ <i>Перед ставкой проверьте составы на травмы!</i>"
+            msg += "⚠️ <i>Перед ставкой проверьте составы!</i>"
             await update.message.reply_text(msg, parse_mode="HTML")
 
 # ---------- Запуск ----------
@@ -222,8 +215,7 @@ def main():
         raise SystemExit("BOT_TOKEN не задан!")
         
     app = Application.builder().token(BOT_TOKEN).build()
-    
-    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("⚽ Привет! Я бот для поиска матчей на ОЗ.\n\nОтправь /scan, и я сам найду матчи на завтра по твоей стратегии!")))
+    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("⚽ Привет! Отправь /scan, и я найду матчи на ОЗ на завтра.")))
     app.add_handler(CommandHandler("scan", scan_matches))
     
     logger.info("Bot started (auto-scan mode)")
