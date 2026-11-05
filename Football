@@ -1,215 +1,97 @@
 import os
-import asyncio
 import logging
-from datetime import datetime, timedelta
-
 import requests
-from dotenv import load_dotenv
+from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-load_dotenv()
-
+# --- Настройки ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-SSTATS_API_KEY = os.getenv("SSTATS_API_KEY", "").strip()
-API_BASE = "https://api.sstats.net"
+# Публичный API FutPicks, ключи не нужны
+FUTPICKS_API_URL = "https://futpicks.com/api/picks/board"
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger("btts-bot")
 
-# ---------- API-клиент через requests (чтобы обойти блокировки) ----------
-async def fetch_json(endpoint: str, params: dict = None):
-    url = f"{API_BASE}{endpoint}"
-    if params is None:
-        params = {}
-    if SSTATS_API_KEY:
-        params["apikey"] = SSTATS_API_KEY
-    else:
-        return {"error": "Ключ SSTATS_API_KEY не найден в переменных!"}
-        
+# --- Функция для запроса к открытому API FutPicks ---
+def fetch_futpicks_btts(date_str: str):
+    """Запрашивает у FutPicks прогнозы на BTTS (Обе забьют) на указанную дату."""
+    params = {
+        "date": date_str,
+        "market": "BTTS", # Нас интересует только рынок "Обе забьют"
+        "rating": "Good"  # Фильтр по качеству прогноза (можно убрать, чтобы получить больше матчей)
+    }
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
-        
-    def _fetch():
-        try:
-            resp = requests.get(url, params=params, headers=headers, timeout=20)
-            if resp.status_code != 200:
-                return {"error": f"HTTP {resp.status_code}: {resp.text[:100]}"}
-            return resp.json()
-        except Exception as e:
-            return {"error": f"Сеть/Таймаут: {repr(e)}"}
-
-    return await asyncio.to_thread(_fetch)
-
-# ---------- Парсинг коэффициентов ----------
-def extract_odds(game):
-    odds_1x2 = None
-    odds_btts = None
     
-    for market in game.get("odds", []):
-        market_name = market.get("marketName", "").lower()
-        
-        if "1x2" in market_name or "match result" in market_name or "winner" in market_name:
-            prices = market.get("odds", [])
-            if len(prices) >= 3:
-                p_dict = {str(p.get("name", "")).lower(): p.get("value") for p in prices}
-                odds_1x2 = {
-                    "home": p_dict.get("1", p_dict.get("home", prices[0].get("value"))),
-                    "draw": p_dict.get("x", p_dict.get("draw", prices[1].get("value"))),
-                    "away": p_dict.get("2", p_dict.get("away", prices[2].get("value")))
-                }
-                
-        elif "btts" in market_name or "both teams" in market_name:
-            prices = market.get("odds", [])
-            for p in prices:
-                p_name = str(p.get("name", "")).lower()
-                if "yes" in p_name or p_name == "1":
-                    odds_btts = p.get("value")
-    
-    return odds_1x2, odds_btts
+    try:
+        # Используем requests, так как он более устойчив к блокировкам
+        response = requests.get(FUTPICKS_API_URL, params=params, headers=headers, timeout=20)
+        response.raise_for_status() # Вызовет исключение при ошибке HTTP
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Ошибка при запросе к FutPicks API: {e}")
+        return {"error": f"Сетевая ошибка или таймаут: {repr(e)}"}
+    except ValueError:
+        logger.error("FutPicks API вернул ответ, который не является JSON.")
+        return {"error": "Ошибка парсинга ответа от API."}
 
-# ---------- Статистика команды ----------
-async def get_team_stats(team_id: int):
-    data = await fetch_json("/Games/list", {
-        "Team": team_id, "Ended": "true", "Limit": 10
-    })
-    if not data or "error" in data or "data" not in data:
-        return None
-
-    matches = data["data"]
-    if len(matches) < 5:
-        return None
-
-    btts_count = 0
-    scored_count = 0
-    clean_count = 0
-    total_goals = 0
-
-    for m in matches:
-        home_goals = m.get("homeFTResult") or 0
-        away_goals = m.get("awayFTResult") or 0
-        total_goals += (home_goals + away_goals)
-
-        if m.get("homeTeam", {}).get("id") == team_id:
-            scored, conceded = home_goals, away_goals
-        else:
-            scored, conceded = away_goals, home_goals
-
-        if scored > 0 and conceded > 0: btts_count += 1
-        if scored > 0: scored_count += 1
-        if conceded == 0: clean_count += 1
-
-    n = len(matches)
-    return {
-        "btts_pct": (btts_count / n) * 100,
-        "scored": scored_count,
-        "clean_sheets": clean_count,
-        "avg_total": total_goals / n,
-    }
-
-# ---------- Сканер ----------
+# --- Обработчик команды /scan ---
 async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 Запрашиваю матчи на завтра и анализирую...")
-    tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+    await update.message.reply_text("🔍 Ищу матчи на ОЗ через открытый источник FutPicks...")
     
-    data = await fetch_json("/Games/list", {"Date": tomorrow, "TimeZone": 3, "Limit": 1000})
+    tomorrow = (datetime.now()).strftime("%Y-%m-%d") # Ищем на сегодня (или можно на завтра)
     
-    if not data or "error" in data:
-        err_text = data.get("error", "Неизвестная ошибка") if data else "Пустой ответ"
-        await update.message.reply_text(f"❌ Ошибка API:\n{err_text}")
-        return
-        
-    matches = data.get("data", [])
-    if not matches:
-        await update.message.reply_text("❌ API вернул пустой список матчей.")
-        return
-
-    await update.message.reply_text(f"📅 Найдено {len(matches)} матчей. Проверяю статистику (первые 40)...")
-    results = []
+    data = fetch_futpicks_btts(tomorrow)
     
-    for m in matches[:40]:
-        home_team = m.get("homeTeam", {})
-        away_team = m.get("awayTeam", {})
-        home_id = home_team.get("id")
-        away_id = away_team.get("id")
-        
-        if not home_id or not away_id: continue
-
-        odds_1x2, odds_btts = extract_odds(m)
-        if not odds_1x2 or not odds_btts: continue 
-
-        try:
-            raw_h, raw_d, raw_a = 1/odds_1x2["home"], 1/odds_1x2["draw"], 1/odds_1x2["away"]
-            total_p = raw_h + raw_d + raw_a
-            diff = abs((raw_h/total_p) - (raw_a/total_p)) * 100
-            if diff > 30: continue
-        except (KeyError, ZeroDivisionError, TypeError):
-            continue
-
-        home_stats = await get_team_stats(home_id)
-        away_stats = await get_team_stats(away_id)
-        
-        if not home_stats or not away_stats: continue
-
-        if home_stats["btts_pct"] < 50 or away_stats["btts_pct"] < 50: continue
-        if home_stats["scored"] < 5 or away_stats["scored"] < 5: continue
-        if home_stats["clean_sheets"] > 5 and away_stats["clean_sheets"] > 5: continue
-        if home_stats["avg_total"] < 2.2 or away_stats["avg_total"] < 2.2: continue
-
-        score = 0
-        for b in (home_stats["btts_pct"], away_stats["btts_pct"]):
-            score += 15 if b >= 70 else 10 if b >= 60 else 5 if b >= 50 else 0
-        for s in (home_stats["scored"], away_stats["scored"]):
-            score += 10 if s >= 8 else 6 if s >= 7 else 3 if s >= 6 else 0
-        for c in (home_stats["clean_sheets"], away_stats["clean_sheets"]):
-            score += 10 if c <= 2 else 6 if c <= 3 else 3 if c <= 4 else 0
-        
-        avg = (home_stats["avg_total"] + away_stats["avg_total"]) / 2
-        score += 10 if avg >= 3.0 else 7 if avg >= 2.7 else 4 if avg >= 2.5 else 0
-        score += 15 if diff <= 10 else 10 if diff <= 20 else 5 if diff <= 30 else 0
-
-        verdict = "SIGNAL" if score >= 80 else "WATCHLIST" if score >= 65 else "SKIP"
-        
-        if verdict != "SKIP":
-            results.append({
-                "match": f"{home_team.get('name')} — {away_team.get('name')}",
-                "odds": odds_btts,
-                "score": score,
-                "verdict": verdict,
-                "stats": f"ОЗ: {home_stats['btts_pct']:.0f}%/{away_stats['btts_pct']:.0f}% | Тотал: {avg:.1f}"
-            })
-
-    if not results:
-        await update.message.reply_text("😕 Подходящих матчей на завтра не найдено.")
-    else:
-        results.sort(key=lambda x: x["score"], reverse=True)
-        msg = "📊 <b>Результаты:</b>\n\n"
-        for r in results:
-            emoji = "🟢" if r["verdict"] == "SIGNAL" else "🟡"
-            msg += f"{emoji} <b>{r['match']}</b>\n   Кэф ОЗ: {r['odds']} | Скоринг: {r['score']}\n   {r['stats']}\n\n"
-        await update.message.reply_text(msg, parse_mode="HTML")
-
-# ---------- Тест API ----------
-async def test_api(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Тестирую API...")
-    data = await fetch_json("/Games/list", {"Date": "2026-11-06", "TimeZone": 3})
     if "error" in data:
-        await update.message.reply_text(f"❌ Ошибка: {data['error']}")
-    else:
-        count = len(data.get("data", []))
-        await update.message.reply_text(f"✅ Успех! Получено {count} матчей.")
+        await update.message.reply_text(f"❌ Не удалось получить данные:\n{data['error']}")
+        return
 
-# ---------- Запуск ----------
-def main():
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("⚽ Привет! Отправь /scan, и я найду матчи.")))
-    app.add_handler(CommandHandler("scan", scan_matches))
-    app.add_handler(CommandHandler("testapi", test_api))
+    # В ответе FutPicks массив с прогнозами обычно лежит в поле 'picks' или 'data'
+    picks = data.get("picks") or data.get("data") or []
     
-    # ВОТ ЭТА СТРОЧКА ПОКАЖЕТ, ЧТО КОД ОБНОВИЛСЯ
-    logger.info("Bot started (requests mode)") 
+    if not picks:
+        await update.message.reply_text("😕 На сегодня не найдено прогнозов на ОЗ с рейтингом 'Good'.")
+        return
+
+    msg = "📊 <b>Матчи с прогнозом на ОЗ (FutPicks):</b>\n\n"
+    count = 0
+    for pick in picks:
+        # Извлекаем нужные поля (названия могут немного отличаться, но это стандарт)
+        match_name = pick.get("match_name") or f"{pick.get('home_team')} — {pick.get('away_team')}"
+        league = pick.get("league_name", "Лига не указана")
+        odds = pick.get("odds")
+        rating = pick.get("rating", "N/A")
+        
+        # Формируем сообщение
+        msg += f"🟢 <b>{match_name}</b>\n"
+        msg += f"   🏆 {league}\n"
+        if odds:
+            msg += f"   💰 Кэф: {odds:.2f}\n"
+        msg += f"   ⭐ Рейтинг: {rating}\n\n"
+        count += 1
+        
+        # Ограничим вывод, чтобы не превысить лимит сообщения в Telegram
+        if count >= 15:
+            msg += "<i>... и другие</i>"
+            break
+
+    await update.message.reply_text(msg, parse_mode="HTML")
+
+# --- Запуск бота ---
+def main():
+    if not BOT_TOKEN:
+        raise SystemExit("BOT_TOKEN не задан!")
+
+    app = Application.builder().token(BOT_TOKEN).build()
+    
+    # Добавляем команды
+    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("⚽ Привет! Отправь /scan, и я найду матчи на ОЗ через открытый источник.")))
+    app.add_handler(CommandHandler("scan", scan_matches))
+    
+    logger.info("Bot started (FutPicks open source mode)")
     app.run_polling()
 
 if __name__ == "__main__":
