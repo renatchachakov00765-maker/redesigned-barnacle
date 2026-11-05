@@ -2,7 +2,7 @@ import os
 import logging
 import requests
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -38,13 +38,28 @@ def fetch_data(url, params=None):
     except Exception as e:
         return {"error": str(e)}
 
-def find_field(obj, keys, default="Скрыто"):
-    for key in keys:
-        if key in obj and obj[key]:
-            val = obj[key]
-            if isinstance(val, dict): return val.get("name", default)
-            return str(val)
-    return default
+# --- Умный поиск даты и лиги ---
+def extract_time(event):
+    keys = ["start_time", "startTime", "date", "datetime", "kickoff", "time", "utc_date"]
+    for k in keys:
+        if event.get(k):
+            val = str(event[k])
+            # Очищаем ISO формат (2026-11-05T18:00:00Z -> 05.11 18:00)
+            try:
+                dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
+                return dt.strftime("%d.%m %H:%M")
+            except:
+                return val[:16].replace("T", " ")
+    return "Время скрыто"
+
+def extract_league(event):
+    keys = ["league_name", "leagueName", "league", "tournament", "competition", "season"]
+    for k in keys:
+        if event.get(k):
+            val = event[k]
+            if isinstance(val, dict): return val.get("name", "Лига скрыта")
+            return str(val) # Если это просто ID или строка
+    return "Лига скрыта"
 
 def fetch_1x2_odds_sync():
     data = fetch_data(f"{API_BASE}/odds/", {"market": "1x2", "limit": 500})
@@ -65,27 +80,20 @@ def fetch_1x2_odds_sync():
             except: pass
     return odds_map
 
-# --- ИСПРАВЛЕННАЯ СТАТИСТИКА (Через общий эндпоинт событий) ---
 def get_team_stats_sync(team_id):
-    # Запрашиваем последние 20 матчей команды через общий список событий
     data = fetch_data(f"{API_BASE}/events/", {"team_id": team_id, "limit": 20})
-    
     if isinstance(data, dict) and "error" in data: return None
     matches = data if isinstance(data, list) else []
     
-    # Оставляем только завершенные матчи
     finished = []
     for m in matches:
         status = str(m.get("status") or "").lower()
         if status in ["finished", "ft", "ended", "3", "after_penalties"] or m.get("finished") == True:
             finished.append(m)
             
-    if len(finished) < 5: 
-        return None # Если меньше 5 завершенных матчей, статистика невалидна
+    if len(finished) < 5: return None 
 
-    # Берем 10 последних
     matches_to_analyze = finished[:10]
-    
     btts, scored_count, clean_count = 0, 0, 0
     goals_scored, goals_conceded = 0, 0
     total_matches = len(matches_to_analyze)
@@ -93,8 +101,6 @@ def get_team_stats_sync(team_id):
     for m in matches_to_analyze:
         hg = m.get("home_score") or m.get("homeScore") or 0
         ag = m.get("away_score") or m.get("awayScore") or 0
-        
-        # Определяем ID команд в матче
         h_id = m.get("home_team", {}).get("id") if isinstance(m.get("home_team"), dict) else m.get("home_team_id")
         a_id = m.get("away_team", {}).get("id") if isinstance(m.get("away_team"), dict) else m.get("away_team_id")
         
@@ -119,7 +125,7 @@ def get_team_stats_sync(team_id):
     }
 
 async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 Сканирую (полная статистика через /events/)...")
+    await update.message.reply_text("🔍 Сканирую...")
 
     try:
         today = datetime.now().strftime("%Y-%m-%d")
@@ -128,7 +134,7 @@ async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         x12_map = await asyncio.to_thread(fetch_1x2_odds_sync)
 
         if not isinstance(events, list) or not isinstance(btts_list, list):
-            await update.message.reply_text("❌ Ошибка API при получении данных.")
+            await update.message.reply_text("❌ Ошибка API.")
             return
 
         btts_map = {}
@@ -145,7 +151,7 @@ async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     if eid not in btts_map or price > btts_map[eid]: btts_map[eid] = price
                 except: pass
 
-        results, rejected = [], []
+        results = []
 
         for event in events:
             if not isinstance(event, dict): continue
@@ -154,8 +160,8 @@ async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             a_team = event.get("away_team", {})
             match_name = f"{get_name(h_team)} — {get_name(a_team)}"
             
-            time_str = find_field(event, ["start_time", "date", "datetime", "kickoff"])
-            league_str = find_field(event, ["league", "tournament", "competition", "season"])
+            time_str = extract_time(event)
+            league_str = extract_league(event)
 
             league_lower = league_str.lower()
             if any(kw in league_lower for kw in BLACKLIST_KEYWORDS):
@@ -180,9 +186,7 @@ async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             h_stats = await asyncio.to_thread(get_team_stats_sync, h_id)
             a_stats = await asyncio.to_thread(get_team_stats_sync, a_id)
             
-            if not h_stats or not a_stats:
-                rejected.append(f"• {match_name}: нет 5+ завершенных матчей в API")
-                continue
+            if not h_stats or not a_stats: continue
 
             h_str = f"{h_stats['goals_scored']}-{h_stats['goals_conceded']} в {h_stats['total_matches']} матчах"
             a_str = f"{a_stats['goals_scored']}-{a_stats['goals_conceded']} в {a_stats['total_matches']} матчах"
@@ -190,7 +194,6 @@ async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if (h_stats["btts_pct"] < 50 or a_stats["btts_pct"] < 50 or 
                 h_stats["scored_count"] < 5 or a_stats["scored_count"] < 5 or 
                 h_stats["avg_total"] < 2.2 or a_stats["avg_total"] < 2.2):
-                rejected.append(f"• {match_name} (ОЗ {odds:.2f}): слабая статистика\n   Хозяева: {h_str} (ОЗ {h_stats['btts_pct']:.0f}%)\n   Гости: {a_str} (ОЗ {a_stats['btts_pct']:.0f}%)")
                 continue
 
             score = 0
@@ -211,13 +214,10 @@ async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             })
 
         if not results:
-            msg = "😕 <b>Подходящих матчей не найдено.</b>\n\n"
-            if rejected:
-                msg += "📋 <b>Причины отсева (до 5):</b>\n" + "\n\n".join(rejected[:5])
-            await update.message.reply_text(msg, parse_mode="HTML")
+            await update.message.reply_text("😕 Подходящих матчей по статистике не найдено.")
         else:
             results.sort(key=lambda x: x["score"], reverse=True)
-            msg = "📊 <b>Результаты анализа (статистика подтверждена):</b>\n\n"
+            msg = "📊 <b>Результаты анализа:</b>\n\n"
             for r in results:
                 msg += f"🟢 <b>{r['match']}</b>\n"
                 msg += f"   ⏰ {r['time']} | 🏆 {r['league']}\n"
@@ -234,7 +234,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("⚽ Привет! Отправь /scan.")))
     app.add_handler(CommandHandler("scan", scan_matches))
-    logger.info("Bot started (Robust Events Stats)")
+    logger.info("Bot started (Final Version)")
     app.run_polling()
 
 if __name__ == "__main__":
