@@ -2,8 +2,7 @@ import os
 import logging
 import requests
 import asyncio
-import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -39,33 +38,25 @@ def fetch_data(url, params=None):
     except Exception as e:
         return {"error": str(e)}
 
-# --- Улучшенный парсинг даты и лиги ---
+def fetch_leagues_map():
+    data = fetch_data(f"{API_BASE}/leagues/")
+    if isinstance(data, dict) and "error" in data: return {}
+    leagues = data if isinstance(data, list) else []
+    return {l.get("id"): l.get("name") for l in leagues if isinstance(l, dict) and l.get("id")}
+
+# --- ПЕРЕВОД ВРЕМЕНИ В ИЖЕВСК (UTC+4) ---
 def extract_time(event):
-    date_val = event.get("date") or event.get("start_time") or event.get("utcDate") or event.get("kickoff")
+    date_val = event.get("event_date")
     if date_val:
         try:
-            # Пытаемся преобразовать ISO формат (2026-11-05T18:00:00Z)
+            # Парсим исходную строку (она в UTC)
             dt = datetime.fromisoformat(str(date_val).replace("Z", "+00:00"))
-            return dt.strftime("%d.%m %H:%M")
+            # Прибавляем 4 часа для Ижевска
+            dt_local = dt + timedelta(hours=4)
+            return dt_local.strftime("%d.%m %H:%M")
         except:
             return str(date_val)[:16].replace("T", " ")
     return "Время скрыто"
-
-def extract_league(event):
-    # 1. Прячемся внутрь season.league (как в документации OpenAPI)
-    season = event.get("season")
-    if isinstance(season, dict):
-        league = season.get("league")
-        if isinstance(league, dict):
-            return league.get("name", "Скрыто")
-            
-    # 2. Если нет, ищем в прямых ключах
-    for k in ["league_name", "leagueName", "league", "tournament", "competition"]:
-        val = event.get(k)
-        if val:
-            if isinstance(val, dict): return val.get("name", "Скрыто")
-            return str(val)
-    return "Лига скрыта"
 
 def fetch_1x2_odds_sync():
     data = fetch_data(f"{API_BASE}/odds/", {"market": "1x2", "limit": 500})
@@ -107,8 +98,8 @@ def get_team_stats_sync(team_id):
     for m in matches_to_analyze:
         hg = m.get("home_score") or m.get("homeScore") or 0
         ag = m.get("away_score") or m.get("awayScore") or 0
-        h_id = m.get("home_team", {}).get("id") if isinstance(m.get("home_team"), dict) else m.get("home_team_id")
-        a_id = m.get("away_team", {}).get("id") if isinstance(m.get("away_team"), dict) else m.get("away_team_id")
+        h_id = m.get("home_team_id")
+        a_id = m.get("away_team_id")
         
         if h_id == team_id: s, c = hg, ag
         elif a_id == team_id: s, c = ag, hg
@@ -135,6 +126,8 @@ async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     try:
         today = datetime.now().strftime("%Y-%m-%d")
+        
+        leagues_map = await asyncio.to_thread(fetch_leagues_map)
         events = await asyncio.to_thread(fetch_data, f"{API_BASE}/events/", {"date_from": today, "date_to": today, "limit": 300})
         btts_list = await asyncio.to_thread(fetch_data, f"{API_BASE}/odds/", {"market": "btts", "limit": 500})
         x12_map = await asyncio.to_thread(fetch_1x2_odds_sync)
@@ -161,17 +154,19 @@ async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         for event in events:
             if not isinstance(event, dict): continue
-            eid = event.get("id") or event.get("event_id")
-            h_team = event.get("home_team", {})
-            a_team = event.get("away_team", {})
-            match_name = f"{get_name(h_team)} — {get_name(a_team)}"
+            eid = event.get("id")
+            
+            league_id = event.get("league_id")
+            league_name = leagues_map.get(league_id, f"Лига ID {league_id}")
+            
+            h_name = event.get("home_team")
+            a_name = event.get("away_team")
+            match_name = f"{h_name} — {a_name}"
             
             time_str = extract_time(event)
-            league_str = extract_league(event)
 
-            league_lower = league_str.lower()
-            if any(kw in league_lower for kw in BLACKLIST_KEYWORDS):
-                continue
+            league_lower = league_name.lower()
+            if any(kw in league_lower for kw in BLACKLIST_KEYWORDS): continue
 
             if eid not in btts_map: continue
             
@@ -183,8 +178,8 @@ async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 oh, od, oa = x12_map[eid]["home"], x12_map[eid]["draw"], x12_map[eid]["away"]
                 odds_str = f"{oh:.2f} / {od:.2f} / {oa:.2f}"
 
-            h_id = h_team.get("id") if isinstance(h_team, dict) else event.get("home_team_id")
-            a_id = a_team.get("id") if isinstance(a_team, dict) else event.get("away_team_id")
+            h_id = event.get("home_team_id")
+            a_id = event.get("away_team_id")
             
             if not h_id or not a_id: continue
 
@@ -211,7 +206,7 @@ async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             score += 10 if avg >= 3.0 else 7 if avg >= 2.7 else 4
 
             results.append({
-                "match": match_name, "time": time_str, "league": league_str,
+                "match": match_name, "time": time_str, "league": league_name,
                 "odds": odds, "odds_str": odds_str, "score": score,
                 "h_str": h_str, "a_str": a_str,
                 "btts": f"ОЗ {h_stats['btts_pct']:.0f}%/{a_stats['btts_pct']:.0f}%"
@@ -221,7 +216,7 @@ async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("😕 Подходящих матчей не найдено.")
         else:
             results.sort(key=lambda x: x["score"], reverse=True)
-            msg = "📊 <b>Результаты анализа:</b>\n\n"
+            msg = "📊 <b>Результаты анализа (время по Ижевску):</b>\n\n"
             for r in results:
                 msg += f"🟢 <b>{r['match']}</b>\n"
                 msg += f"   ⏰ {r['time']} | 🏆 {r['league']}\n"
@@ -234,27 +229,11 @@ async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {repr(e)}")
 
-# --- НОВАЯ КОМАНДА ДЛЯ ОТЛАДКИ ---
-async def debug_api(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🛠 Достаю сырые данные из API...")
-    today = datetime.now().strftime("%Y-%m-%d")
-    events = await asyncio.to_thread(fetch_data, f"{API_BASE}/events/", {"date_from": today, "date_to": today, "limit": 1})
-    
-    if isinstance(events, list) and len(events) > 0:
-        # Превращаем первый матч в красивый текст и отправляем
-        raw_json = json.dumps(events[0], indent=2, ensure_ascii=False)
-        if len(raw_json) > 3500:
-            raw_json = raw_json[:3500] + "\n... (обрезано)"
-        await update.message.reply_text(f"<code>{raw_json}</code>", parse_mode="HTML")
-    else:
-        await update.message.reply_text(f"❌ Не удалось получить данные. Ответ: {events}")
-
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("⚽ Привет! Отправь /scan.")))
     app.add_handler(CommandHandler("scan", scan_matches))
-    app.add_handler(CommandHandler("debug", debug_api)) # Добавили дебаг
-    logger.info("Bot started (Final + Debug)")
+    logger.info("Bot started (Izhevsk Time)")
     app.run_polling()
 
 if __name__ == "__main__":
