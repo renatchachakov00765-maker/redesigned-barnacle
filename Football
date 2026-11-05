@@ -1,333 +1,512 @@
-import asyncio
+import os
+import csv
 import logging
-from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+import sqlite3
+from datetime import datetime
+from pathlib import Path
 
-import aiohttp
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from dotenv import load_dotenv
+from telegram import Update
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    ConversationHandler, filters, ContextTypes,
+)
 
-# ========== НАСТРОЙКИ ==========
-BOT_TOKEN = "ВСТАВЬ_ТОКЕН_БОТА"
-CHAT_ID = "ВСТАВЬ_CHAT_ID"
+load_dotenv()
 
-# Фильтры стратегии
-HOME_WIN_MIN = 1.35
-HOME_WIN_MAX = 1.75
-AWAY_WIN_MIN = 1.90
-HOME_SCORED_MIN = 4  # из 5 матчей
-HOME_AVG_GOALS_MIN = 1.5
-AWAY_CONCEDED_MIN = 4  # из 5 матчей
-AWAY_AVG_CONCEDED_MIN = 1.3
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+DB_PATH = Path(__file__).parent / "btts_bot.db"
 
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("btts-bot")
 
 
-# ========== SSTATS API ==========
-class SstatsAPI:
-    BASE_URL = "https://api.sstats.net"
-    
-    def __init__(self):
-        self.session: Optional[aiohttp.ClientSession] = None
-    
-    async def __aenter__(self):
-        self.session = aiohttp.ClientSession()
-        return self
-    
-    async def __aexit__(self, *args):
-        if self.session:
-            await self.session.close()
-    
-    async def get_today_matches(self) -> List[Dict]:
-        """Получить матчи на сегодня"""
-        today = datetime.now().strftime("%Y-%m-%d")
-        url = f"{self.BASE_URL}/games/list"
-        params = {
-            'date': today,
-            'limit': 1000
-        }
-        
-        async with self.session.get(url, params=params) as response:
-            if response.status != 200:
-                logger.error(f"Sstats error: {response.status}")
-                return []
-            data = await response.json()
-        
-        return data if isinstance(data, list) else data.get('games', data.get('matches', []))
-    
-    async def get_match(self, match_id: str) -> Optional[Dict]:
-        """Получить полную информацию о матче"""
-        url = f"{self.BASE_URL}/games/{match_id}"
-        
-        async with self.session.get(url) as response:
-            if response.status != 200:
-                return None
-            return await response.json()
-    
-    async def get_last_games_stats(self, team_id: int, venue: str = 'all') -> Optional[Dict]:
-        """Получить статистику последних матчей команды"""
-        url = f"{self.BASE_URL}/games/last-games-stats"
-        params = {
-            'team': team_id,
-            'venue': venue,
-            'limit': 5
-        }
-        
-        async with self.session.get(url, params=params) as response:
-            if response.status != 200:
-                return None
-            return await response.json()
+# ---------- Состояния ----------
+(
+    S_MATCH, S_ODDS, S_ODDS_OZ,
+    S_BTTS_H, S_BTTS_A,
+    S_SCORED_H, S_SCORED_A,
+    S_CLEAN_H, S_CLEAN_A,
+    S_AVG_H, S_AVG_A,
+    S_MODEL,
+) = range(12)
 
 
-# ========== ФИЛЬТР МАТЧЕЙ ==========
-class MatchFilter:
-    def __init__(self, api: SstatsAPI):
-        self.api = api
-    
-    async def check_match(self, match: Dict) -> tuple:
-        """Проверить матч по всем фильтрам"""
-        match_id = match.get('Id') or match.get('id')
-        home_id = match.get('HomeTeamId') or match.get('homeTeamId')
-        away_id = match.get('AwayTeamId') or match.get('awayTeamId')
-        
-        if not all([match_id, home_id, away_id]):
-            return False, "Нет ID"
-        
-        # Коэффициенты из списка матчей
-        odds = match.get('Odds', {})
-        home_odds = odds.get('1') or odds.get('Home')
-        away_odds = odds.get('2') or odds.get('Away')
-        
-        # Если нет в списке, запрашиваем детально
-        if not home_odds or not away_odds:
-            details = await self.api.get_match(match_id)
-            if details:
-                odds = details.get('Odds', {})
-                home_odds = odds.get('1') or odds.get('Home')
-                away_odds = odds.get('2') or odds.get('Away')
-        
-        if not home_odds or not (HOME_WIN_MIN <= home_odds <= HOME_WIN_MAX):
-            return False, f"Кэф хозяев {home_odds} вне {HOME_WIN_MIN}-{HOME_WIN_MAX}"
-        
-        if not away_odds or away_odds < AWAY_WIN_MIN:
-            return False, f"Кэф гостей {away_odds} < {AWAY_WIN_MIN}"
-        
-        # Статистика хозяев дома
-        home_stats = await self.api.get_last_games_stats(home_id, venue='home')
-        if not home_stats:
-            return False, "Нет статистики хозяев"
-        
-        home_matches = home_stats.get('Games', home_stats.get('games', []))[:5]
-        if len(home_matches) < 5:
-            return False, "Мало матчей хозяев"
-        
-        scored = 0
-        total_goals = 0
-        for m in home_matches:
-            home_score = m.get('HomeScore', m.get('homeScore', 0))
-            if home_score > 0:
-                scored += 1
-            total_goals += home_score
-        
-        avg_goals = total_goals / len(home_matches)
-        
-        if scored < HOME_SCORED_MIN:
-            return False, f"Хозяева забили в {scored}/5"
-        
-        if avg_goals < HOME_AVG_GOALS_MIN:
-            return False, f"Средние голы {avg_goals:.2f} < {HOME_AVG_GOALS_MIN}"
-        
-        # Статистика гостей на выезде
-        away_stats = await self.api.get_last_games_stats(away_id, venue='away')
-        if not away_stats:
-            return False, "Нет статистики гостей"
-        
-        away_matches = away_stats.get('Games', away_stats.get('games', []))[:5]
-        if len(away_matches) < 5:
-            return False, "Мало матчей гостей"
-        
-        conceded = 0
-        total_conceded = 0
-        for m in away_matches:
-            home_score = m.get('HomeScore', m.get('homeScore', 0))
-            if home_score > 0:
-                conceded += 1
-            total_conceded += home_score
-        
-        avg_conceded = total_conceded / len(away_matches)
-        
-        if conceded < AWAY_CONCEDED_MIN:
-            return False, f"Гости пропустили в {conceded}/5"
-        
-        if avg_conceded < AWAY_AVG_CONCEDED_MIN:
-            return False, f"Средние пропущенные {avg_conceded:.2f} < {AWAY_AVG_CONCEDED_MIN}"
-        
-        return True, {
-            'home_odds': home_odds,
-            'away_odds': away_odds,
-            'home_scored': scored,
-            'home_avg': round(avg_goals, 2),
-            'away_conceded': conceded,
-            'away_avg': round(avg_conceded, 2)
-        }
+# ---------- БД ----------
+def init_db() -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS matches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                match TEXT NOT NULL,
+                odds_home REAL, odds_draw REAL, odds_away REAL,
+                odds_btts REAL, model_odds REAL,
+                btts_home REAL, btts_away REAL,
+                scored_home REAL, scored_away REAL,
+                clean_home REAL, clean_away REAL,
+                avg_home REAL, avg_away REAL,
+                diff_prob REAL, score INTEGER,
+                verdict TEXT, stake_pct REAL, result TEXT
+            )
+        """)
+        conn.commit()
 
 
-# ========== TELEGRAM БОТ ==========
-class BetBot:
-    def __init__(self):
-        self.api = SstatsAPI()
-        self.filter = MatchFilter(self.api)
-        self.scheduler = AsyncIOScheduler()
-        self.found_matches: List[Dict] = []
-    
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Команда /start"""
-        keyboard = [
-            [InlineKeyboardButton("🔍 Сканировать", callback_data='scan')],
-            [InlineKeyboardButton("📋 Найденные", callback_data='list')],
-            [InlineKeyboardButton("⚙️ Фильтры", callback_data='filters')],
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
-            '🤖 Бот стратегии "Гол фаворита дома"\n\n'
-            f'🏠 Кэф хозяев: {HOME_WIN_MIN}–{HOME_WIN_MAX}\n'
-            f'✈️ Кэф гостей: ≥{AWAY_WIN_MIN}\n'
-            f'⚽ Хозяева забивали: {HOME_SCORED_MIN}/5\n'
-            f'🥅 Гости пропускали: {AWAY_CONCEDED_MIN}/5',
-            reply_markup=reply_markup
-        )
-    
-    async def scan(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Сканирование матчей"""
-        query = update.callback_query
-        await query.answer()
-        await query.edit_message_text("🔍 Сканирую матчи на сегодня...")
-        
-        async with self.api:
-            matches = await self.api.get_today_matches()
-            found = []
-            
-            for match in matches:
-                is_valid, result = await self.filter.check_match(match)
-                if is_valid:
-                    match['stats'] = result
-                    found.append(match)
-                    await self._notify(context, match)
-            
-            self.found_matches = found
-        
-        await query.edit_message_text(
-            f"✅ Сканирование завершено\n\n"
-            f"Проверено матчей: {len(matches)}\n"
-            f"Подходит: {len(found)}"
-        )
-    
-    async def list_matches(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Список найденных"""
-        query = update.callback_query
-        await query.answer()
-        
-        if not self.found_matches:
-            await query.edit_message_text("Пусто. Запусти сканирование.")
+def save_match(m: dict) -> int:
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute("""
+            INSERT INTO matches (
+                created_at, match, odds_home, odds_draw, odds_away, odds_btts,
+                model_odds, btts_home, btts_away, scored_home, scored_away,
+                clean_home, clean_away, avg_home, avg_away, diff_prob,
+                score, verdict, stake_pct, result
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            m["created_at"], m["match"],
+            m["odds_home"], m["odds_draw"], m["odds_away"], m["odds_btts"],
+            m.get("model_odds"), m["btts_home"], m["btts_away"],
+            m["scored_home"], m["scored_away"],
+            m["clean_home"], m["clean_away"],
+            m["avg_home"], m["avg_away"],
+            m["diff_prob"], m["score"], m["verdict"],
+            m["stake_pct"], "PENDING",
+        ))
+        conn.commit()
+        return cur.lastrowid
+
+
+# ---------- Парсеры (устойчивы к форматам) ----------
+def parse_float(text: str) -> float:
+    return float(text.replace(",", ".").strip())
+
+
+def parse_ratio(text: str) -> float:
+    """'7/10'→7.0, '7'→7.0, '70%'→7.0"""
+    t = text.strip().replace("%", "").replace(",", ".")
+    if "/" in t:
+        a, b = t.split("/", 1)
+        return float(a) / float(b) * 10
+    return float(t)
+
+
+def parse_percent(text: str) -> float:
+    """'70'→70, '70%'→70, '7/10'→70"""
+    t = text.strip().replace("%", "").replace(",", ".")
+    if "/" in t:
+        a, b = t.split("/", 1)
+        return float(a) / float(b) * 100
+    return float(t)
+
+
+def normalize_probs(oh: float, od: float, oa: float) -> tuple:
+    rh, rd, ra = 1/oh, 1/od, 1/oa
+    t = rh + rd + ra
+    return rh/t, rd/t, ra/t
+
+
+# ---------- Фильтры и скоринг ----------
+def apply_filters(d: dict) -> tuple:
+    ph, _, pa = normalize_probs(d["odds_home"], d["odds_draw"], d["odds_away"])
+    diff = abs(ph - pa) * 100
+
+    fails = []
+    if diff > 30:
+        fails.append(f"Равность: разрыв {diff:.1f} п.п. > 30")
+    if d["btts_home"] < 50:
+        fails.append(f"ОЗ хозяев {d['btts_home']:.0f}% < 50%")
+    if d["btts_away"] < 50:
+        fails.append(f"ОЗ гостей {d['btts_away']:.0f}% < 50%")
+    if d["scored_home"] < 5:
+        fails.append(f"Забивала хозяев {d['scored_home']:.1f} < 5")
+    if d["scored_away"] < 5:
+        fails.append(f"Забивала гостей {d['scored_away']:.1f} < 5")
+    if d["clean_home"] > 5 and d["clean_away"] > 5:
+        fails.append("Обе часто на ноль (clean ≥ 5)")
+    if d["avg_home"] < 2.2 or d["avg_away"] < 2.2:
+        fails.append("Средний тотал ниже 2.2")
+
+    return len(fails) == 0, fails, diff
+
+
+def calc_score(d: dict, diff: float) -> int:
+    score = 0
+    for b in (d["btts_home"], d["btts_away"]):
+        score += 15 if b >= 70 else 10 if b >= 60 else 5 if b >= 50 else 0
+    for s in (d["scored_home"], d["scored_away"]):
+        score += 10 if s >= 8 else 6 if s >= 7 else 3 if s >= 6 else 0
+    for c in (d["clean_home"], d["clean_away"]):
+        score += 10 if c <= 2 else 6 if c <= 3 else 3 if c <= 4 else 0
+    avg = (d["avg_home"] + d["avg_away"]) / 2
+    score += 10 if avg >= 3.0 else 7 if avg >= 2.7 else 4 if avg >= 2.5 else 0
+    score += 15 if diff <= 10 else 10 if diff <= 20 else 5 if diff <= 30 else 0
+
+    m = d.get("model_odds")
+    if m and m > 1:
+        try:
+            edge = ((1/m) - (1/d["odds_btts"])) * 100
+            if edge >= 5: score += 10
+            elif edge >= 3: score += 5
+        except ZeroDivisionError:
+            pass
+    return score
+
+
+def make_verdict(score: int, passed: bool) -> tuple:
+    if not passed:
+        return "SKIP", 0.0
+    if score >= 80:
+        return "SIGNAL", 1.0
+    if score >= 65:
+        return "WATCHLIST", 0.5
+    return "SKIP", 0.0
+
+
+# ---------- Команды ----------
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "⚽ Бот ОЗ-фильтров (prematch)\n\n"
+        "/analyze — новый анализ\n"
+        "/log — последние 10\n"
+        "/stats — сводка\n"
+        "/result <id> win|loss|void — отметить результат\n"
+        "/export — выгрузить CSV\n"
+        "/cancel — отменить ввод"
+    )
+
+
+async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data.clear()
+    await update.message.reply_text("Отменено.")
+    return ConversationHandler.END
+
+
+async def analyze_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data.clear()
+    await update.message.reply_text("1/12. Название матча (Дома — Гости):")
+    return S_MATCH
+
+
+async def step_match(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    txt = update.message.text.strip()
+    if len(txt) < 3:
+        await update.message.reply_text("Слишком коротко. Ещё раз:")
+        return S_MATCH
+    ctx.user_data["match"] = txt
+    await update.message.reply_text("2/12. Кэфы 1X2 (home draw away), напр. 1.77 4.10 4.20:")
+    return S_ODDS
+
+
+async def step_odds(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        parts = update.message.text.replace(",", ".").split()
+        if len(parts) != 3:
+            raise ValueError
+        h, dr, a = map(float, parts)
+        if min(h, dr, a) <= 1.0:
+            raise ValueError
+        ctx.user_data.update(odds_home=h, odds_draw=dr, odds_away=a)
+    except ValueError:
+        await update.message.reply_text("Нужны 3 числа > 1, напр. 1.77 4.10 4.20")
+        return S_ODDS
+    await update.message.reply_text("3/12. Кэф на ОЗ «Да» (напр. 1.58):")
+    return S_ODDS_OZ
+
+
+async def step_odds_oz(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        v = parse_float(update.message.text)
+        if v <= 1.0:
+            raise ValueError
+        ctx.user_data["odds_btts"] = v
+    except ValueError:
+        await update.message.reply_text("Число > 1, напр. 1.58")
+        return S_ODDS_OZ
+    await update.message.reply_text("4/12. % ОЗ хозяев (напр. 70 или 7/10):")
+    return S_BTTS_H
+
+
+async def step_btts_h(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        v = parse_percent(update.message.text)
+        if not 0 <= v <= 100:
+            raise ValueError
+        ctx.user_data["btts_home"] = v
+    except ValueError:
+        await update.message.reply_text("0–100, напр. 70 или 7/10")
+        return S_BTTS_H
+    await update.message.reply_text("5/12. % ОЗ гостей:")
+    return S_BTTS_A
+
+
+async def step_btts_a(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        v = parse_percent(update.message.text)
+        if not 0 <= v <= 100:
+            raise ValueError
+        ctx.user_data["btts_away"] = v
+    except ValueError:
+        await update.message.reply_text("0–100, напр. 50")
+        return S_BTTS_A
+    await update.message.reply_text("6/12. Забивала хозяев (X/10, напр. 8):")
+    return S_SCORED_H
+
+
+async def step_scored_h(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        v = parse_ratio(update.message.text)
+        if not 0 <= v <= 10:
+            raise ValueError
+        ctx.user_data["scored_home"] = v
+    except ValueError:
+        await update.message.reply_text("0–10, напр. 8")
+        return S_SCORED_H
+    await update.message.reply_text("7/12. Забивала гостей:")
+    return S_SCORED_A
+
+
+async def step_scored_a(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        v = parse_ratio(update.message.text)
+        if not 0 <= v <= 10:
+            raise ValueError
+        ctx.user_data["scored_away"] = v
+    except ValueError:
+        await update.message.reply_text("0–10, напр. 6")
+        return S_SCORED_A
+    await update.message.reply_text("8/12. Не пропускала хозяев (0–10):")
+    return S_CLEAN_H
+
+
+async def step_clean_h(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        v = parse_ratio(update.message.text)
+        if not 0 <= v <= 10:
+            raise ValueError
+        ctx.user_data["clean_home"] = v
+    except ValueError:
+        await update.message.reply_text("0–10, напр. 4")
+        return S_CLEAN_H
+    await update.message.reply_text("9/12. Не пропускала гостей:")
+    return S_CLEAN_A
+
+
+async def step_clean_a(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        v = parse_ratio(update.message.text)
+        if not 0 <= v <= 10:
+            raise ValueError
+        ctx.user_data["clean_away"] = v
+    except ValueError:
+        await update.message.reply_text("0–10, напр. 2")
+        return S_CLEAN_A
+    await update.message.reply_text("10/12. Средний тотал хозяев (напр. 3.20):")
+    return S_AVG_H
+
+
+async def step_avg_h(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        v = parse_float(update.message.text)
+        if not 0 <= v <= 15:
+            raise ValueError
+        ctx.user_data["avg_home"] = v
+    except ValueError:
+        await update.message.reply_text("Число 0–15, напр. 3.20")
+        return S_AVG_H
+    await update.message.reply_text("11/12. Средний тотал гостей:")
+    return S_AVG_A
+
+
+async def step_avg_a(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        v = parse_float(update.message.text)
+        if not 0 <= v <= 15:
+            raise ValueError
+        ctx.user_data["avg_away"] = v
+    except ValueError:
+        await update.message.reply_text("Число 0–15, напр. 3.22")
+        return S_AVG_A
+    await update.message.reply_text("12/12. Кэф модели ScanGoal на ОЗ «Да». Если нет — отправь 0:")
+    return S_MODEL
+
+
+async def step_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        v = parse_float(update.message.text)
+        if v < 0 or (v > 0 and v <= 1.0):
+            raise ValueError
+        ctx.user_data["model_odds"] = v if v > 1 else None
+    except ValueError:
+        await update.message.reply_text("0 (нет) или число > 1, напр. 1.67")
+        return S_MODEL
+
+    d = ctx.user_data
+    d["created_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    passed, fails, diff = apply_filters(d)
+    score = calc_score(d, diff)
+    verdict, stake = make_verdict(score, passed)
+
+    msg = (
+        f"📊 <b>{d['match']}</b>\n{d['created_at']}\n\n"
+        f"<b>Ввод:</b>\n"
+        f"• 1X2: {d['odds_home']} / {d['odds_draw']} / {d['odds_away']}\n"
+        f"• ОЗ: {d['odds_btts']}\n"
+        f"• Модель: {d.get('model_odds') or '—'}\n"
+        f"• Равность: {diff:.1f} п.п.\n"
+        f"• ОЗ %: {d['btts_home']:.0f} / {d['btts_away']:.0f}\n"
+        f"• Забивала: {d['scored_home']:.1f} / {d['scored_away']:.1f}\n"
+        f"• Чистые: {d['clean_home']:.1f} / {d['clean_away']:.1f}\n"
+        f"• Тотал: {d['avg_home']:.2f} / {d['avg_away']:.2f}\n\n"
+    )
+    msg += "✅ Фильтры: PASS\n" if passed else (
+        "❌ Фильтры: FAIL\n" + "\n".join(f"• {r}" for r in fails) + "\n"
+    )
+    if d["odds_btts"] < 1.55:
+        msg += f"\n⚠️ Кэф ОЗ {d['odds_btts']} < 1.55 — ценность под вопросом\n"
+
+    emoji = {"SIGNAL": "🟢", "WATCHLIST": "🟡", "SKIP": "🔴"}[verdict]
+    msg += f"\n{emoji} <b>{verdict}</b> | Скоринг: {score} | Ставка: {stake}% банка"
+
+    mid = save_match({
+        "created_at": d["created_at"], "match": d["match"],
+        "odds_home": d["odds_home"], "odds_draw": d["odds_draw"],
+        "odds_away": d["odds_away"], "odds_btts": d["odds_btts"],
+        "model_odds": d.get("model_odds"),
+        "btts_home": d["btts_home"], "btts_away": d["btts_away"],
+        "scored_home": d["scored_home"], "scored_away": d["scored_away"],
+        "clean_home": d["clean_home"], "clean_away": d["clean_away"],
+        "avg_home": d["avg_home"], "avg_away": d["avg_away"],
+        "diff_prob": diff, "score": score, "verdict": verdict,
+        "stake_pct": stake,
+    })
+    msg += f"\nID: {mid} (для /result)"
+    await update.message.reply_text(msg, parse_mode="HTML")
+    ctx.user_data.clear()
+    return ConversationHandler.END
+
+
+async def cmd_log(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT id, created_at, match, score, verdict, stake_pct, result "
+            "FROM matches ORDER BY id DESC LIMIT 10"
+        ).fetchall()
+    if not rows:
+        await update.message.reply_text("Лог пуст.")
+        return
+    msg = "📜 Последние 10:\n\n"
+    for r in rows:
+        msg += f"#{r[0]} {r[1]} | {r[2]}\n  {r[3]} | {r[4]} | {r[5]}% | {r[6]}\n"
+    await update.message.reply_text(msg)
+
+
+async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        total = conn.execute("SELECT COUNT(*) FROM matches").fetchone()[0]
+        if total == 0:
+            await update.message.reply_text("Нет данных.")
             return
-        
-        text = "📋 Найденные матчи:\n\n"
-        for i, m in enumerate(self.found_matches, 1):
-            home = m.get('HomeTeam', m.get('homeTeam', '?'))
-            away = m.get('AwayTeam', m.get('awayTeam', '?'))
-            if isinstance(home, dict):
-                home = home.get('Name', home.get('name', '?'))
-            if isinstance(away, dict):
-                away = away.get('Name', away.get('name', '?'))
-            text += f"{i}. {home} — {away}\n"
-        
-        keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data='start')]]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-    
-    async def filters_info(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Информация о фильтрах"""
-        query = update.callback_query
-        await query.answer()
-        
-        text = (
-            "⚙️ Текущие фильтры:\n\n"
-            f"Кэф хозяев: {HOME_WIN_MIN}–{HOME_WIN_MAX}\n"
-            f"Кэф гостей: ≥{AWAY_WIN_MIN}\n"
-            f"Хозяева забивали: {HOME_SCORED_MIN}/5 матчей\n"
-            f"Средние голы хозяев: ≥{HOME_AVG_GOALS_MIN}\n"
-            f"Гости пропускали: {AWAY_CONCEDED_MIN}/5 матчей\n"
-            f"Средние пропущенные: ≥{AWAY_AVG_CONCEDED_MIN}"
+        by_v = conn.execute(
+            "SELECT verdict, COUNT(*), AVG(score) FROM matches GROUP BY verdict"
+        ).fetchall()
+        by_r = conn.execute(
+            "SELECT result, COUNT(*) FROM matches GROUP BY result"
+        ).fetchall()
+    msg = f"📊 Всего: {total}\n\nПо вердиктам:\n"
+    for v, c, a in by_v:
+        msg += f"• {v}: {c} (ср. {a:.1f})\n"
+    msg += "\nПо результатам:\n"
+    for r, c in by_r:
+        msg += f"• {r}: {c}\n"
+    await update.message.reply_text(msg)
+
+
+async def cmd_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    args = ctx.args or []
+    if len(args) != 2 or args[1].lower() not in ("win", "loss", "void"):
+        await update.message.reply_text("Формат: /result <id> win|loss|void")
+        return
+    try:
+        mid = int(args[0])
+    except ValueError:
+        await update.message.reply_text("ID должен быть числом.")
+        return
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            "UPDATE matches SET result = ? WHERE id = ?",
+            (args[1].lower(), mid),
         )
-        
-        keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data='start')]]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-    
-    async def _notify(self, context: ContextTypes.DEFAULT_TYPE, match: Dict):
-        """Уведомление о подходящем матче"""
-        home = match.get('HomeTeam', match.get('homeTeam', '?'))
-        away = match.get('AwayTeam', match.get('awayTeam', '?'))
-        if isinstance(home, dict):
-            home = home.get('Name', home.get('name', '?'))
-        if isinstance(away, dict):
-            away = away.get('Name', away.get('name', '?'))
-        
-        stats = match.get('stats', {})
-        
-        text = (
-            f"⚽ Подходящий матч!\n\n"
-            f"🏠 {home} — {away} ✈️\n\n"
-            f"📊 Кэфы: П1 {stats.get('home_odds')} | П2 {stats.get('away_odds')}\n"
-            f"⚽ Хозяева забивали: {stats.get('home_scored')}/5 (ср. {stats.get('home_avg')})\n"
-            f"🥅 Гости пропускали: {stats.get('away_conceded')}/5 (ср. {stats.get('away_avg')})"
-        )
-        
-        await context.bot.send_message(chat_id=CHAT_ID, text=text)
-    
-    def setup_scheduler(self, application: Application):
-        """Автосканирование каждые 30 минут"""
-        self.scheduler.add_job(
-            self._auto_scan, 'interval', minutes=30, args=[application]
-        )
-        self.scheduler.start()
-    
-    async def _auto_scan(self, application: Application):
-        """Фоновое сканирование"""
-        logger.info("Auto-scan started")
-        async with self.api:
-            matches = await self.api.get_today_matches()
-            for match in matches:
-                is_valid, result = await self.filter.check_match(match)
-                if is_valid and not self._already_found(match):
-                    match['stats'] = result
-                    self.found_matches.append(match)
-                    await self._notify(application.bot, match)
-    
-    def _already_found(self, match: Dict) -> bool:
-        """Проверка дубликатов"""
-        match_id = match.get('Id') or match.get('id')
-        return any((m.get('Id') or m.get('id')) == match_id for m in self.found_matches)
+        conn.commit()
+    if cur.rowcount == 0:
+        await update.message.reply_text(f"ID {mid} не найден.")
+    else:
+        await update.message.reply_text(f"✅ #{mid} → {args[1].lower()}")
 
 
-# ========== ЗАПУСК ==========
-def main():
-    application = Application.builder().token(BOT_TOKEN).build()
-    bot = BetBot()
-    
-    application.add_handler(CommandHandler("start", bot.start))
-    application.add_handler(CallbackQueryHandler(bot.scan, pattern='^scan$'))
-    application.add_handler(CallbackQueryHandler(bot.list_matches, pattern='^list$'))
-    application.add_handler(CallbackQueryHandler(bot.filters_info, pattern='^filters$'))
-    application.add_handler(CallbackQueryHandler(bot.start, pattern='^start$'))
-    
-    bot.setup_scheduler(application)
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute("SELECT * FROM matches ORDER BY id")
+        cols = [d[0] for d in cur.description]
+        rows = cur.fetchall()
+    if not rows:
+        await update.message.reply_text("Нет данных.")
+        return
+    path = Path(__file__).parent / "export.csv"
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(cols)
+        w.writerows(rows)
+    with open(path, "rb") as f:
+        await update.message.reply_document(document=f, filename="btts_export.csv")
 
 
-if __name__ == '__main__':
+async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error(f"Update {update} caused error {ctx.error}", exc_info=ctx.error)
+
+
+# ---------- Запуск ----------
+def main() -> None:
+    if not BOT_TOKEN:
+        raise SystemExit("BOT_TOKEN не задан. Проверьте .env или переменные окружения.")
+    init_db()
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("analyze", analyze_entry)],
+        states={
+            S_MATCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, step_match)],
+            S_ODDS: [MessageHandler(filters.TEXT & ~filters.COMMAND, step_odds)],
+            S_ODDS_OZ: [MessageHandler(filters.TEXT & ~filters.COMMAND, step_odds_oz)],
+            S_BTTS_H: [MessageHandler(filters.TEXT & ~filters.COMMAND, step_btts_h)],
+            S_BTTS_A: [MessageHandler(filters.TEXT & ~filters.COMMAND, step_btts_a)],
+            S_SCORED_H: [MessageHandler(filters.TEXT & ~filters.COMMAND, step_scored_h)],
+            S_SCORED_A: [MessageHandler(filters.TEXT & ~filters.COMMAND, step_scored_a)],
+            S_CLEAN_H: [MessageHandler(filters.TEXT & ~filters.COMMAND, step_clean_h)],
+            S_CLEAN_A: [MessageHandler(filters.TEXT & ~filters.COMMAND, step_clean_a)],
+            S_AVG_H: [MessageHandler(filters.TEXT & ~filters.COMMAND, step_avg_h)],
+            S_AVG_A: [MessageHandler(filters.TEXT & ~filters.COMMAND, step_avg_a)],
+            S_MODEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, step_model)],
+        },
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+        allow_reentry=True,
+    )
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_start))
+    app.add_handler(CommandHandler("log", cmd_log))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("result", cmd_result))
+    app.add_handler(CommandHandler("export", cmd_export))
+    app.add_handler(conv)
+    app.add_error_handler(error_handler)
+
+    logger.info("Bot started (prematch only)")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
     main()
