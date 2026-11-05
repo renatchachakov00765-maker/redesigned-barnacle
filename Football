@@ -3,7 +3,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta
 
-import aiohttp
+import requests
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -17,37 +17,35 @@ API_BASE = "https://api.sstats.net"
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger("btts-bot")
 
-# ---------- API-клиент с обработкой ошибок и обходом блокировок ----------
-async def fetch_json(session: aiohttp.ClientSession, endpoint: str, params: dict = None):
+# ---------- API-клиент (через requests, чтобы обойти блокировки) ----------
+async def fetch_json(endpoint: str, params: dict = None):
     url = f"{API_BASE}{endpoint}"
     if params is None:
         params = {}
     if SSTATS_API_KEY:
         params["apikey"] = SSTATS_API_KEY
     else:
-        return {"error": "Ключ SSTATS_API_KEY не найден в переменных окружения!"}
+        return {"error": "Ключ SSTATS_API_KEY не найден в переменных!"}
         
-    # Прикидываемся браузером, чтобы избежать блокировок
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json"
     }
         
+    # Запускаем синхронный requests в отдельном потоке, чтобы не вешать бота
+    def _fetch():
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=20)
+            if resp.status_code != 200:
+                return {"error": f"HTTP {resp.status_code}: {resp.text[:100]}"}
+            return resp.json()
+        except Exception as e:
+            return {"error": f"Сеть/Таймаут: {repr(e)}"}
+
     try:
-        async with session.get(url, params=params, headers=headers, timeout=30) as resp:
-            text = await resp.text()
-            if resp.status != 200:
-                error_msg = f"HTTP {resp.status}: {text[:150]}"
-                logger.error(f"API error {endpoint}: {error_msg}")
-                return {"error": error_msg}
-            try:
-                return await resp.json()
-            except Exception:
-                return {"error": f"Ошибка парсинга JSON. Ответ сервера: {text[:150]}"}
+        return await asyncio.to_thread(_fetch)
     except Exception as e:
-        error_msg = f"Сеть/Таймаут: {repr(e)}"
-        logger.error(f"API error {endpoint}: {error_msg}")
-        return {"error": error_msg}
+        return {"error": f"Ошибка потока: {repr(e)}"}
 
 # ---------- Парсинг коэффициентов ----------
 def extract_odds(game):
@@ -77,8 +75,8 @@ def extract_odds(game):
     return odds_1x2, odds_btts
 
 # ---------- Статистика команды ----------
-async def get_team_stats(session: aiohttp.ClientSession, team_id: int):
-    data = await fetch_json(session, "/Games/list", {
+async def get_team_stats(team_id: int):
+    data = await fetch_json("/Games/list", {
         "Team": team_id, "Ended": "true", "Limit": 10
     })
     if not data or "error" in data or "data" not in data:
@@ -119,95 +117,104 @@ async def get_team_stats(session: aiohttp.ClientSession, team_id: int):
 async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 Запрашиваю матчи на завтра и анализирую... Это займет около минуты.")
 
-    async with aiohttp.ClientSession() as session:
-        tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+    tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+    
+    data = await fetch_json("/Games/list", {
+        "Date": tomorrow, "TimeZone": 3, "Limit": 1000
+    })
+    
+    if not data or "error" in data:
+        err_text = data.get("error", "Неизвестная ошибка") if data else "Пустой ответ"
+        await update.message.reply_text(f"❌ Ошибка API:\n{err_text}")
+        return
         
-        data = await fetch_json(session, "/Games/list", {
-            "Date": tomorrow, "TimeZone": 3, "Limit": 1000
-        })
+    if "data" not in data:
+        await update.message.reply_text("❌ API вернул данные, но список матчей пуст.")
+        return
+
+    matches = data["data"]
+    await update.message.reply_text(f"📅 Найдено {len(matches)} матчей. Проверяю статистику (первые 40)...")
+
+    results = []
+    
+    for m in matches[:40]:
+        home_team = m.get("homeTeam", {})
+        away_team = m.get("awayTeam", {})
+        home_id = home_team.get("id")
+        away_id = away_team.get("id")
         
-        if not data or "error" in data:
-            err_text = data.get("error", "Неизвестная ошибка") if data else "Пустой ответ"
-            await update.message.reply_text(f"❌ Ошибка API:\n{err_text}")
-            return
+        if not home_id or not away_id: continue
+
+        odds_1x2, odds_btts = extract_odds(m)
+        if not odds_1x2 or not odds_btts:
+            continue 
+
+        try:
+            raw_h, raw_d, raw_a = 1/odds_1x2["home"], 1/odds_1x2["draw"], 1/odds_1x2["away"]
+            total_p = raw_h + raw_d + raw_a
+            p_h, p_a = raw_h / total_p, raw_a / total_p
+            diff = abs(p_h - p_a) * 100
             
-        if "data" not in data:
-            await update.message.reply_text("❌ API вернул данные, но список матчей пуст (возможно, на завтра нет игр).")
-            return
+            if diff > 30: continue
+        except (KeyError, ZeroDivisionError, TypeError):
+            continue
 
-        matches = data["data"]
-        await update.message.reply_text(f"📅 Найдено {len(matches)} матчей. Проверяю статистику (первые 40 для лимитов API)...")
-
-        results = []
+        home_stats = await get_team_stats(home_id)
+        away_stats = await get_team_stats(away_id)
         
-        for m in matches[:40]:
-            home_team = m.get("homeTeam", {})
-            away_team = m.get("awayTeam", {})
-            home_id = home_team.get("id")
-            away_id = away_team.get("id")
-            
-            if not home_id or not away_id: continue
+        if not home_stats or not away_stats: continue
 
-            odds_1x2, odds_btts = extract_odds(m)
-            if not odds_1x2 or not odds_btts:
-                continue 
+        if home_stats["btts_pct"] < 50 or away_stats["btts_pct"] < 50: continue
+        if home_stats["scored"] < 5 or away_stats["scored"] < 5: continue
+        if home_stats["clean_sheets"] > 5 and away_stats["clean_sheets"] > 5: continue
+        if home_stats["avg_total"] < 2.2 or away_stats["avg_total"] < 2.2: continue
 
-            try:
-                raw_h, raw_d, raw_a = 1/odds_1x2["home"], 1/odds_1x2["draw"], 1/odds_1x2["away"]
-                total_p = raw_h + raw_d + raw_a
-                p_h, p_a = raw_h / total_p, raw_a / total_p
-                diff = abs(p_h - p_a) * 100
-                
-                if diff > 30: continue
-            except (KeyError, ZeroDivisionError, TypeError):
-                continue
+        score = 0
+        for b in (home_stats["btts_pct"], away_stats["btts_pct"]):
+            score += 15 if b >= 70 else 10 if b >= 60 else 5 if b >= 50 else 0
+        for s in (home_stats["scored"], away_stats["scored"]):
+            score += 10 if s >= 8 else 6 if s >= 7 else 3 if s >= 6 else 0
+        for c in (home_stats["clean_sheets"], away_stats["clean_sheets"]):
+            score += 10 if c <= 2 else 6 if c <= 3 else 3 if c <= 4 else 0
+        
+        avg = (home_stats["avg_total"] + away_stats["avg_total"]) / 2
+        score += 10 if avg >= 3.0 else 7 if avg >= 2.7 else 4 if avg >= 2.5 else 0
+        score += 15 if diff <= 10 else 10 if diff <= 20 else 5 if diff <= 30 else 0
 
-            home_stats = await get_team_stats(session, home_id)
-            away_stats = await get_team_stats(session, away_id)
-            
-            if not home_stats or not away_stats: continue
+        verdict = "SIGNAL" if score >= 80 else "WATCHLIST" if score >= 65 else "SKIP"
+        
+        if verdict != "SKIP":
+            results.append({
+                "match": f"{home_team.get('name')} — {away_team.get('name')}",
+                "odds": odds_btts,
+                "score": score,
+                "verdict": verdict,
+                "stats": f"ОЗ: {home_stats['btts_pct']:.0f}%/{away_stats['btts_pct']:.0f}% | Тотал: {avg:.1f}"
+            })
 
-            if home_stats["btts_pct"] < 50 or away_stats["btts_pct"] < 50: continue
-            if home_stats["scored"] < 5 or away_stats["scored"] < 5: continue
-            if home_stats["clean_sheets"] > 5 and away_stats["clean_sheets"] > 5: continue
-            if home_stats["avg_total"] < 2.2 or away_stats["avg_total"] < 2.2: continue
+    if not results:
+        await update.message.reply_text("😕 Подходящих матчей на завтра не найдено.")
+    else:
+        results.sort(key=lambda x: x["score"], reverse=True)
+        msg = "📊 <b>Результаты сканирования:</b>\n\n"
+        for r in results:
+            emoji = "🟢" if r["verdict"] == "SIGNAL" else "🟡"
+            msg += f"{emoji} <b>{r['match']}</b>\n"
+            msg += f"   Кэф ОЗ: {r['odds']} | Скоринг: {r['score']}\n"
+            msg += f"   {r['stats']}\n\n"
+        
+        msg += "⚠️ <i>Перед ставкой проверьте составы!</i>"
+        await update.message.reply_text(msg, parse_mode="HTML")
 
-            score = 0
-            for b in (home_stats["btts_pct"], away_stats["btts_pct"]):
-                score += 15 if b >= 70 else 10 if b >= 60 else 5 if b >= 50 else 0
-            for s in (home_stats["scored"], away_stats["scored"]):
-                score += 10 if s >= 8 else 6 if s >= 7 else 3 if s >= 6 else 0
-            for c in (home_stats["clean_sheets"], away_stats["clean_sheets"]):
-                score += 10 if c <= 2 else 6 if c <= 3 else 3 if c <= 4 else 0
-            
-            avg = (home_stats["avg_total"] + away_stats["avg_total"]) / 2
-            score += 10 if avg >= 3.0 else 7 if avg >= 2.7 else 4 if avg >= 2.5 else 0
-            score += 15 if diff <= 10 else 10 if diff <= 20 else 5 if diff <= 30 else 0
-
-            verdict = "SIGNAL" if score >= 80 else "WATCHLIST" if score >= 65 else "SKIP"
-            
-            if verdict != "SKIP":
-                results.append({
-                    "match": f"{home_team.get('name')} — {away_team.get('name')}",
-                    "odds": odds_btts,
-                    "score": score,
-                    "verdict": verdict,
-                    "stats": f"ОЗ: {home_stats['btts_pct']:.0f}%/{away_stats['btts_pct']:.0f}% | Тотал: {avg:.1f}"
-                })
-
-        if not results:
-            await update.message.reply_text("😕 Подходящих матчей на завтра не найдено.")
-        else:
-            results.sort(key=lambda x: x["score"], reverse=True)
-            msg = "📊 <b>Результаты сканирования:</b>\n\n"
-            for r in results:
-                emoji = "🟢" if r["verdict"] == "SIGNAL" else "🟡"
-                msg += f"{emoji} <b>{r['match']}</b>\n"
-                msg += f"   Кэф ОЗ: {r['odds']} | Скоринг: {r['score']}\n"
-                msg += f"   {r['stats']}\n\n"
-            
-            msg += "⚠️ <i>Перед ставкой проверьте составы!</i>"
-            await update.message.reply_text(msg, parse_mode="HTML")
+# ---------- Тест API (для дебага) ----------
+async def test_api(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Тестирую API...")
+    data = await fetch_json("/Games/list", {"Date": "2026-11-06", "TimeZone": 3})
+    if "error" in data:
+        await update.message.reply_text(f"❌ Ошибка: {data['error']}")
+    else:
+        count = len(data.get("data", []))
+        await update.message.reply_text(f"✅ Успех! Получено {count} матчей. Ключ рабочий.")
 
 # ---------- Запуск ----------
 def main():
@@ -217,8 +224,9 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("⚽ Привет! Отправь /scan, и я найду матчи на ОЗ на завтра.")))
     app.add_handler(CommandHandler("scan", scan_matches))
+    app.add_handler(CommandHandler("testapi", test_api))
     
-    logger.info("Bot started (auto-scan mode)")
+    logger.info("Bot started (requests mode)")
     app.run_polling()
 
 if __name__ == "__main__":
