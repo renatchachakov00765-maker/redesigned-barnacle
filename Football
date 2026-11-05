@@ -33,89 +33,80 @@ def fetch_data(url, params=None):
     except Exception as e:
         return {"error": str(e)}
 
-# --- Сбор коэффициентов 1X2 для проверки равности ---
+# --- Умный поиск полей (для времени и лиги) ---
+def find_field(obj, keys, default="Скрыто"):
+    for key in keys:
+        if key in obj and obj[key]:
+            val = obj[key]
+            if isinstance(val, dict): return val.get("name", default)
+            return str(val)
+    return default
+
+# --- Получение коэффициентов 1X2 ---
 def fetch_1x2_odds_sync():
-    url = f"{API_BASE}/odds/"
-    params = {"market": "1x2", "limit": 200}
-    data = fetch_data(url, params)
-    if isinstance(data, dict) and "error" in data:
-        return {}
-        
+    data = fetch_data(f"{API_BASE}/odds/", {"market": "1x2", "limit": 300})
+    if isinstance(data, dict) and "error" in data: return {}
     odds_map = {}
     for row in data:
         if not isinstance(row, dict): continue
         eid = row.get("event_id") or row.get("event") or row.get("match_id")
-        outcome = row.get("outcome") or row.get("name") or row.get("label")
+        outcome = str(row.get("outcome") or row.get("name") or row.get("label") or "").lower()
         price = row.get("decimal_odds") or row.get("odds") or row.get("price") or row.get("value")
-        
         if eid and outcome and price:
-            if eid not in odds_map:
-                odds_map[eid] = {}
+            if eid not in odds_map: odds_map[eid] = {}
             try:
                 price = float(price)
-                out_lower = str(outcome).lower()
-                if out_lower in ["1", "home", "w1"]: odds_map[eid]["home"] = price
-                elif out_lower in ["x", "draw"]: odds_map[eid]["draw"] = price
-                elif out_lower in ["2", "away", "w2"]: odds_map[eid]["away"] = price
+                if outcome in ["1", "home", "w1"]: odds_map[eid]["home"] = price
+                elif outcome in ["x", "draw"]: odds_map[eid]["draw"] = price
+                elif outcome in ["2", "away", "w2"]: odds_map[eid]["away"] = price
             except: pass
-            
     return odds_map
 
-# --- Сбор статистики команды ---
+# --- Статистика команды ---
 def get_team_stats_sync(team_id):
-    url = f"{API_BASE}/teams/{team_id}/fixtures/"
-    params = {"status": "finished", "limit": 10}
-    data = fetch_data(url, params)
-    if isinstance(data, dict) and "error" in data:
-        return None
-        
+    data = fetch_data(f"{API_BASE}/teams/{team_id}/fixtures/", {"status": "finished", "limit": 10})
+    if isinstance(data, dict) and "error" in data: return None
     matches = data if isinstance(data, list) else []
     if len(matches) < 5: return None
 
-    btts_count, scored_count, clean_count, total_goals = 0, 0, 0, 0
-
+    btts, scored, clean, total = 0, 0, 0, 0
     for m in matches:
-        home_goals = m.get("home_score") or m.get("homeScore") or 0
-        away_goals = m.get("away_score") or m.get("awayScore") or 0
-        
+        hg = m.get("home_score") or m.get("homeScore") or 0
+        ag = m.get("away_score") or m.get("awayScore") or 0
         h_id = m.get("home_team", {}).get("id") if isinstance(m.get("home_team"), dict) else m.get("home_team_id")
         a_id = m.get("away_team", {}).get("id") if isinstance(m.get("away_team"), dict) else m.get("away_team_id")
         
-        if h_id == team_id: scored, conceded = home_goals, away_goals
-        elif a_id == team_id: scored, conceded = away_goals, home_goals
+        if h_id == team_id: s, c = hg, ag
+        elif a_id == team_id: s, c = ag, hg
         else: continue
 
-        total_goals += (scored + conceded)
-        if scored > 0 and conceded > 0: btts_count += 1
-        if scored > 0: scored_count += 1
-        if conceded == 0: clean_count += 1
+        total += (s + c)
+        if s > 0 and c > 0: btts += 1
+        if s > 0: scored += 1
+        if c == 0: clean += 1
 
     n = len(matches)
     return {
-        "btts_pct": (btts_count / n) * 100,
-        "scored": scored_count,
-        "clean_sheets": clean_count,
-        "avg_total": total_goals / n,
+        "btts_pct": (btts / n) * 100,
+        "scored": scored,
+        "clean_sheets": clean,
+        "avg_total": total / n,
     }
 
 async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 Сканирую матчи, проверяю равность команд и статистику...")
+    await update.message.reply_text("🔍 Сканирую матчи (с отладкой фильтров)...")
 
     try:
         today = datetime.now().strftime("%Y-%m-%d")
         events = await asyncio.to_thread(fetch_data, f"{API_BASE}/events/", {"date_from": today, "date_to": today, "limit": 100})
-        if not isinstance(events, list):
-            await update.message.reply_text("❌ Ошибка получения событий.")
-            return
-
-        # Получаем ОЗ и 1X2
         btts_list = await asyncio.to_thread(fetch_data, f"{API_BASE}/odds/", {"market": "btts", "limit": 200})
         x12_map = await asyncio.to_thread(fetch_1x2_odds_sync)
 
-        if not isinstance(btts_list, list):
-            await update.message.reply_text("❌ Ошибка получения коэффициентов ОЗ.")
+        if not isinstance(events, list) or not isinstance(btts_list, list):
+            await update.message.reply_text("❌ Ошибка API при получении событий или кэфов.")
             return
 
+        # Собираем лучшие ОЗ
         btts_map = {}
         for row in btts_list:
             if not isinstance(row, dict): continue
@@ -124,39 +115,43 @@ async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if eid and price:
                 try:
                     price = float(price)
-                    if eid not in btts_map or price > btts_map[eid]:
-                        btts_map[eid] = price
+                    if eid not in btts_map or price > btts_map[eid]: btts_map[eid] = price
                 except: pass
 
-        results = []
+        results, rejected = [], []
+
         for event in events:
             if not isinstance(event, dict): continue
             eid = event.get("id") or event.get("event_id")
-            
-            if eid not in btts_map or eid not in x12_map: continue
-            odds = btts_map[eid]
-            if not (1.50 <= odds <= 2.10): continue
-
-            # Считаем разницу в силе по 1X2
-            odds_1x2 = x12_map[eid]
-            diff_pct = 0
-            if "home" in odds_1x2 and "away" in odds_1x2 and "draw" in odds_1x2:
-                try:
-                    rh = 1 / odds_1x2["home"]
-                    rd = 1 / odds_1x2["draw"]
-                    ra = 1 / odds_1x2["away"]
-                    total = rh + rd + ra
-                    ph = rh / total
-                    pa = ra / total
-                    diff_pct = abs(ph - pa) * 100
-                except: pass
-            
-            # ЖЕСТКИЙ ФИЛЬТР: Если разница больше 30 п.п., это явный фаворит. Пропускаем.
-            if diff_pct > 30: 
-                continue
-
             h_team = event.get("home_team", {})
             a_team = event.get("away_team", {})
+            match_name = f"{get_name(h_team)} — {get_name(a_team)}"
+            
+            # Поиск времени и лиги
+            time_str = find_field(event, ["start_time", "date", "datetime", "kickoff"])
+            league_str = find_field(event, ["league", "tournament", "competition", "season"])
+
+            if eid not in btts_map:
+                continue # Если нет ОЗ, сразу пропускаем без записи в лог
+            
+            odds = btts_map[eid]
+            if not (1.50 <= odds <= 2.10):
+                rejected.append(f"• {match_name}: кэф {odds:.2f} (не 1.5-2.1)")
+                continue
+
+            # Проверка равности
+            diff_pct = 0
+            if eid in x12_map and all(k in x12_map[eid] for k in ["home", "draw", "away"]):
+                rh, rd, ra = 1/x12_map[eid]["home"], 1/x12_map[eid]["draw"], 1/x12_map[eid]["away"]
+                total_p = rh + rd + ra
+                diff_pct = abs((rh/total_p) - (ra/total_p)) * 100
+                if diff_pct > 30:
+                    rejected.append(f"• {match_name}: разрыв {diff_pct:.0f} п.п. (фаворит)")
+                    continue
+            else:
+                rejected.append(f"• {match_name}: нет кэфов 1X2 для проверки равности")
+                continue
+
             h_id = h_team.get("id") if isinstance(h_team, dict) else event.get("home_team_id")
             a_id = a_team.get("id") if isinstance(a_team, dict) else event.get("away_team_id")
             
@@ -165,13 +160,22 @@ async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             h_stats = await asyncio.to_thread(get_team_stats_sync, h_id)
             a_stats = await asyncio.to_thread(get_team_stats_sync, a_id)
             
-            if not h_stats or not a_stats: continue
+            if not h_stats or not a_stats:
+                rejected.append(f"• {match_name}: нет истории матчей")
+                continue
 
-            if h_stats["btts_pct"] < 50 or a_stats["btts_pct"] < 50: continue
-            if h_stats["scored"] < 5 or a_stats["scored"] < 5: continue
-            if h_stats["clean_sheets"] > 5 and a_stats["clean_sheets"] > 5: continue
-            if h_stats["avg_total"] < 2.2 or a_stats["avg_total"] < 2.2: continue
+            # Фильтры
+            if h_stats["btts_pct"] < 50 or a_stats["btts_pct"] < 50:
+                rejected.append(f"• {match_name}: низкий ОЗ ({h_stats['btts_pct']:.0f}% / {a_stats['btts_pct']:.0f}%)")
+                continue
+            if h_stats["scored"] < 5 or a_stats["scored"] < 5:
+                rejected.append(f"• {match_name}: редко забивают")
+                continue
+            if h_stats["avg_total"] < 2.2 or a_stats["avg_total"] < 2.2:
+                rejected.append(f"• {match_name}: низкий тотал ({h_stats['avg_total']:.1f} / {a_stats['avg_total']:.1f})")
+                continue
 
+            # Скоринг
             score = 0
             for b in (h_stats["btts_pct"], a_stats["btts_pct"]):
                 score += 15 if b >= 70 else 10 if b >= 60 else 5
@@ -182,27 +186,25 @@ async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             avg = (h_stats["avg_total"] + a_stats["avg_total"]) / 2
             score += 10 if avg >= 3.0 else 7 if avg >= 2.7 else 4
 
-            verdict = "SIGNAL" if score >= 80 else "WATCHLIST" if score >= 65 else "SKIP"
-            if verdict != "SKIP":
-                results.append({
-                    "match": f"{get_name(h_team)} — {get_name(a_team)}",
-                    "odds": odds,
-                    "diff": diff_pct,
-                    "score": score,
-                    "verdict": verdict,
-                    "stats": f"ОЗ: {h_stats['btts_pct']:.0f}%/{a_stats['btts_pct']:.0f}% | Тотал: {avg:.1f}"
-                })
+            results.append({
+                "match": match_name, "time": time_str, "league": league_str,
+                "odds": odds, "diff": diff_pct, "score": score,
+                "stats": f"ОЗ: {h_stats['btts_pct']:.0f}%/{a_stats['btts_pct']:.0f}% | Тотал: {avg:.1f}"
+            })
 
         if not results:
-            await update.message.reply_text("😕 Подходящих матчей не найдено (возможно, все явные фавориты или слабая статистика).")
+            msg = "😕 <b>Подходящих матчей не найдено.</b>\n\n"
+            if rejected:
+                msg += "📋 <b>Причины отсева (первые 10):</b>\n" + "\n".join(rejected[:10])
+            await update.message.reply_text(msg, parse_mode="HTML")
         else:
             results.sort(key=lambda x: x["score"], reverse=True)
-            msg = "📊 <b>Результаты (равные команды + статистика):</b>\n\n"
+            msg = "📊 <b>Результаты анализа:</b>\n\n"
             for r in results:
-                emoji = "🟢" if r["verdict"] == "SIGNAL" else "🟡"
-                msg += f"{emoji} <b>{r['match']}</b>\n"
-                msg += f"   Кэф ОЗ: {r['odds']:.2f} | Равность: {r['diff']:.0f} п.п.\n"
-                msg += f"   Скоринг: {r['score']} | {r['stats']}\n\n"
+                msg += f"🟢 <b>{r['match']}</b>\n"
+                msg += f"   ⏰ {r['time']} | 🏆 {r['league']}\n"
+                msg += f"   💰 Кэф ОЗ: {r['odds']:.2f} | Равность: {r['diff']:.0f} п.п.\n"
+                msg += f"   📈 Скоринг: {r['score']} | {r['stats']}\n\n"
             await update.message.reply_text(msg, parse_mode="HTML")
 
     except Exception as e:
@@ -210,9 +212,9 @@ async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("⚽ Привет! Отправь /scan для поиска матчей.")))
+    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("⚽ Привет! Отправь /scan.")))
     app.add_handler(CommandHandler("scan", scan_matches))
-    logger.info("Bot started (With 1X2 Equality Filter)")
+    logger.info("Bot started (Debug Mode)")
     app.run_polling()
 
 if __name__ == "__main__":
