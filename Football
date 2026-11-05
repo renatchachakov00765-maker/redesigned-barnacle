@@ -24,11 +24,6 @@ BLACKLIST_KEYWORDS = [
     "cup", "copa", "coupe", "pokal", "trophy", "supercup", "молодеж", "товарищ", "кубок"
 ]
 
-def get_name(obj, default="Неизвестно"):
-    if isinstance(obj, dict): return obj.get("name", default)
-    elif isinstance(obj, str): return obj
-    return default
-
 def fetch_data(url, params=None):
     try:
         resp = requests.get(url, headers=HEADERS, params=params, timeout=20)
@@ -44,22 +39,33 @@ def fetch_leagues_map():
     leagues = data if isinstance(data, list) else []
     return {l.get("id"): l.get("name") for l in leagues if isinstance(l, dict) and l.get("id")}
 
-# --- ПЕРЕВОД ВРЕМЕНИ В ИЖЕВСК (UTC+4) ---
+def fetch_all_events_sync():
+    today = datetime.now().strftime("%Y-%m-%d")
+    all_events = []
+    offset = 0
+    limit = 500
+    
+    while True:
+        params = {"date_from": today, "date_to": today, "limit": limit, "offset": offset}
+        data = fetch_data(f"{API_BASE}/events/", params)
+        if not isinstance(data, list) or len(data) == 0: break
+        all_events.extend(data)
+        if len(data) < limit: break
+        offset += limit
+    return all_events
+
 def extract_time(event):
     date_val = event.get("event_date")
     if date_val:
         try:
-            # Парсим исходную строку (она в UTC)
             dt = datetime.fromisoformat(str(date_val).replace("Z", "+00:00"))
-            # Прибавляем 4 часа для Ижевска
-            dt_local = dt + timedelta(hours=4)
+            dt_local = dt + timedelta(hours=4) # Ижевск UTC+4
             return dt_local.strftime("%d.%m %H:%M")
-        except:
-            return str(date_val)[:16].replace("T", " ")
+        except: return str(date_val)[:16].replace("T", " ")
     return "Время скрыто"
 
 def fetch_1x2_odds_sync():
-    data = fetch_data(f"{API_BASE}/odds/", {"market": "1x2", "limit": 500})
+    data = fetch_data(f"{API_BASE}/odds/", {"market": "1x2", "limit": 1000})
     if isinstance(data, dict) and "error" in data: return {}
     odds_map = {}
     for row in data:
@@ -77,8 +83,10 @@ def fetch_1x2_odds_sync():
             except: pass
     return odds_map
 
-def get_team_stats_sync(team_id):
-    data = fetch_data(f"{API_BASE}/events/", {"team_id": team_id, "limit": 20})
+# --- ОБНОВЛЕННАЯ СТАТИСТИКА (Дом / Гости) ---
+def get_team_stats_sync(team_id, is_home):
+    # Запрашиваем 30 матчей, чтобы точно набрать 10 домашних или выездных
+    data = fetch_data(f"{API_BASE}/events/", {"team_id": team_id, "limit": 30})
     if isinstance(data, dict) and "error" in data: return None
     matches = data if isinstance(data, list) else []
     
@@ -88,9 +96,21 @@ def get_team_stats_sync(team_id):
         if status in ["finished", "ft", "ended", "3", "after_penalties"] or m.get("finished") == True:
             finished.append(m)
             
-    if len(finished) < 5: return None 
+    # Фильтруем по домашним/гостевым матчам
+    venue_matches = []
+    for m in finished:
+        h_id = m.get("home_team_id")
+        a_id = m.get("away_team_id")
+        
+        if is_home and h_id == team_id:
+            venue_matches.append(m)
+        elif not is_home and a_id == team_id:
+            venue_matches.append(m)
 
-    matches_to_analyze = finished[:10]
+    if len(venue_matches) < 4: # Если меньше 4 матчей дома/в гостях, статистика невалидна
+        return None 
+
+    matches_to_analyze = venue_matches[:10]
     btts, scored_count, clean_count = 0, 0, 0
     goals_scored, goals_conceded = 0, 0
     total_matches = len(matches_to_analyze)
@@ -122,26 +142,26 @@ def get_team_stats_sync(team_id):
     }
 
 async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 Сканирую...")
+    await update.message.reply_text("🔍 Загружаю матчи (фильтр Дом/Гости)...")
 
     try:
-        today = datetime.now().strftime("%Y-%m-%d")
-        
         leagues_map = await asyncio.to_thread(fetch_leagues_map)
-        events = await asyncio.to_thread(fetch_data, f"{API_BASE}/events/", {"date_from": today, "date_to": today, "limit": 300})
-        btts_list = await asyncio.to_thread(fetch_data, f"{API_BASE}/odds/", {"market": "btts", "limit": 500})
-        x12_map = await asyncio.to_thread(fetch_1x2_odds_sync)
-
-        if not isinstance(events, list) or not isinstance(btts_list, list):
-            await update.message.reply_text("❌ Ошибка API.")
+        events = await asyncio.to_thread(fetch_all_events_sync)
+        
+        if not isinstance(events, list) or len(events) == 0:
+            await update.message.reply_text("😕 Не удалось получить список матчей.")
             return
+
+        await update.message.reply_text(f"📅 Найдено {len(events)} матчей. Фильтрую по коэффициентам...")
+
+        btts_list = await asyncio.to_thread(fetch_data, f"{API_BASE}/odds/", {"market": "btts", "limit": 1000})
+        x12_map = await asyncio.to_thread(fetch_1x2_odds_sync)
 
         btts_map = {}
         for row in btts_list:
             if not isinstance(row, dict): continue
             outcome = str(row.get("outcome") or row.get("name") or row.get("label") or "").lower()
             if outcome not in ["yes", "да", "1", "over", "gg"]: continue
-
             eid = row.get("event_id") or row.get("event") or row.get("match_id")
             price = row.get("decimal_odds") or row.get("odds") or row.get("price") or row.get("value")
             if eid and price:
@@ -150,50 +170,48 @@ async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     if eid not in btts_map or price > btts_map[eid]: btts_map[eid] = price
                 except: pass
 
-        results = []
-
+        candidates = []
         for event in events:
             if not isinstance(event, dict): continue
             eid = event.get("id")
-            
             league_id = event.get("league_id")
             league_name = leagues_map.get(league_id, f"Лига ID {league_id}")
             
+            if any(kw in league_name.lower() for kw in BLACKLIST_KEYWORDS): continue
+
+            if eid not in btts_map: continue
+            odds = btts_map[eid]
+            if not (1.40 <= odds <= 2.20): continue
+            
+            candidates.append((event, odds, league_name))
+
+        await update.message.reply_text(f"🎯 Осталось {len(candidates)} матчей с нужным кэфом. Считаю домашнюю/гостевую статистику...")
+
+        results = []
+        for event, odds, league_name in candidates:
             h_name = event.get("home_team")
             a_name = event.get("away_team")
             match_name = f"{h_name} — {a_name}"
-            
             time_str = extract_time(event)
-
-            league_lower = league_name.lower()
-            if any(kw in league_lower for kw in BLACKLIST_KEYWORDS): continue
-
-            if eid not in btts_map: continue
             
-            odds = btts_map[eid]
-            if not (1.40 <= odds <= 2.10): continue
-
-            odds_str = "1X2 нет"
-            if eid in x12_map and all(k in x12_map[eid] for k in ["home", "draw", "away"]):
-                oh, od, oa = x12_map[eid]["home"], x12_map[eid]["draw"], x12_map[eid]["away"]
-                odds_str = f"{oh:.2f} / {od:.2f} / {oa:.2f}"
-
             h_id = event.get("home_team_id")
             a_id = event.get("away_team_id")
-            
             if not h_id or not a_id: continue
 
-            h_stats = await asyncio.to_thread(get_team_stats_sync, h_id)
-            a_stats = await asyncio.to_thread(get_team_stats_sync, a_id)
+            # ВАЖНО: Передаем True для хозяев и False для гостей
+            h_stats = await asyncio.to_thread(get_team_stats_sync, h_id, True)
+            a_stats = await asyncio.to_thread(get_team_stats_sync, a_id, False)
             
             if not h_stats or not a_stats: continue
 
-            h_str = f"{h_stats['goals_scored']}-{h_stats['goals_conceded']} в {h_stats['total_matches']} матчах"
-            a_str = f"{a_stats['goals_scored']}-{a_stats['goals_conceded']} в {a_stats['total_matches']} матчах"
+            h_str = f"Дома: {h_stats['goals_scored']}-{h_stats['goals_conceded']} в {h_stats['total_matches']} матчах"
+            a_str = f"В гостях: {a_stats['goals_scored']}-{a_stats['goals_conceded']} в {a_stats['total_matches']} матчах"
             
+            # Жесткие фильтры: ОЗ > 50%, Забивали > 5, Сухих < 5, Тотал > 2.3
             if (h_stats["btts_pct"] < 50 or a_stats["btts_pct"] < 50 or 
-                h_stats["scored_count"] < 5 or a_stats["scored_count"] < 5 or 
-                h_stats["avg_total"] < 2.2 or a_stats["avg_total"] < 2.2): continue
+                h_stats["scored_count"] < 6 or a_stats["scored_count"] < 6 or 
+                h_stats["clean_count"] > 4 or a_stats["clean_count"] > 4 or
+                h_stats["avg_total"] < 2.3 or a_stats["avg_total"] < 2.3): continue
 
             score = 0
             for b in (h_stats["btts_pct"], a_stats["btts_pct"]):
@@ -205,6 +223,12 @@ async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             avg = (h_stats["avg_total"] + a_stats["avg_total"]) / 2
             score += 10 if avg >= 3.0 else 7 if avg >= 2.7 else 4
 
+            odds_str = "1X2 нет"
+            eid = event.get("id")
+            if eid in x12_map and all(k in x12_map[eid] for k in ["home", "draw", "away"]):
+                oh, od, oa = x12_map[eid]["home"], x12_map[eid]["draw"], x12_map[eid]["away"]
+                odds_str = f"{oh:.2f} / {od:.2f} / {oa:.2f}"
+
             results.append({
                 "match": match_name, "time": time_str, "league": league_name,
                 "odds": odds, "odds_str": odds_str, "score": score,
@@ -213,17 +237,17 @@ async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             })
 
         if not results:
-            await update.message.reply_text("😕 Подходящих матчей не найдено.")
+            await update.message.reply_text(f"😕 Из {len(events)} матчей ни один не прошел строгий отбор (Дом/Гости).")
         else:
             results.sort(key=lambda x: x["score"], reverse=True)
-            msg = "📊 <b>Результаты анализа (время по Ижевску):</b>\n\n"
+            msg = f"📊 <b>Результаты (с учетом Дом/Гости):</b>\n\n"
             for r in results:
                 msg += f"🟢 <b>{r['match']}</b>\n"
                 msg += f"   ⏰ {r['time']} | 🏆 {r['league']}\n"
                 msg += f"   💰 Кэф ОЗ: {r['odds']:.2f} | 1X2: {r['odds_str']}\n"
                 msg += f"   📈 Скоринг: {r['score']} | {r['btts']}\n"
-                msg += f"   ⚽ Хозяева: {r['h_str']}\n"
-                msg += f"   ⚽ Гости: {r['a_str']}\n\n"
+                msg += f"   ⚽ {r['h_str']}\n"
+                msg += f"   ⚽ {r['a_str']}\n\n"
             await update.message.reply_text(msg, parse_mode="HTML")
 
     except Exception as e:
@@ -233,7 +257,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("⚽ Привет! Отправь /scan.")))
     app.add_handler(CommandHandler("scan", scan_matches))
-    logger.info("Bot started (Izhevsk Time)")
+    logger.info("Bot started (Home/Away Stats)")
     app.run_polling()
 
 if __name__ == "__main__":
