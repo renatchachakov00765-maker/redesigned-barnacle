@@ -17,7 +17,7 @@ API_BASE = "https://api.sstats.net"
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger("btts-bot")
 
-# ---------- API-клиент (через requests, чтобы обойти блокировки) ----------
+# ---------- API-клиент через requests (чтобы обойти блокировки) ----------
 async def fetch_json(endpoint: str, params: dict = None):
     url = f"{API_BASE}{endpoint}"
     if params is None:
@@ -32,7 +32,6 @@ async def fetch_json(endpoint: str, params: dict = None):
         "Accept": "application/json"
     }
         
-    # Запускаем синхронный requests в отдельном потоке, чтобы не вешать бота
     def _fetch():
         try:
             resp = requests.get(url, params=params, headers=headers, timeout=20)
@@ -42,10 +41,7 @@ async def fetch_json(endpoint: str, params: dict = None):
         except Exception as e:
             return {"error": f"Сеть/Таймаут: {repr(e)}"}
 
-    try:
-        return await asyncio.to_thread(_fetch)
-    except Exception as e:
-        return {"error": f"Ошибка потока: {repr(e)}"}
+    return await asyncio.to_thread(_fetch)
 
 # ---------- Парсинг коэффициентов ----------
 def extract_odds(game):
@@ -115,26 +111,22 @@ async def get_team_stats(team_id: int):
 
 # ---------- Сканер ----------
 async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 Запрашиваю матчи на завтра и анализирую... Это займет около минуты.")
-
+    await update.message.reply_text("🔍 Запрашиваю матчи на завтра и анализирую...")
     tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
     
-    data = await fetch_json("/Games/list", {
-        "Date": tomorrow, "TimeZone": 3, "Limit": 1000
-    })
+    data = await fetch_json("/Games/list", {"Date": tomorrow, "TimeZone": 3, "Limit": 1000})
     
     if not data or "error" in data:
         err_text = data.get("error", "Неизвестная ошибка") if data else "Пустой ответ"
         await update.message.reply_text(f"❌ Ошибка API:\n{err_text}")
         return
         
-    if "data" not in data:
-        await update.message.reply_text("❌ API вернул данные, но список матчей пуст.")
+    matches = data.get("data", [])
+    if not matches:
+        await update.message.reply_text("❌ API вернул пустой список матчей.")
         return
 
-    matches = data["data"]
     await update.message.reply_text(f"📅 Найдено {len(matches)} матчей. Проверяю статистику (первые 40)...")
-
     results = []
     
     for m in matches[:40]:
@@ -146,15 +138,12 @@ async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not home_id or not away_id: continue
 
         odds_1x2, odds_btts = extract_odds(m)
-        if not odds_1x2 or not odds_btts:
-            continue 
+        if not odds_1x2 or not odds_btts: continue 
 
         try:
             raw_h, raw_d, raw_a = 1/odds_1x2["home"], 1/odds_1x2["draw"], 1/odds_1x2["away"]
             total_p = raw_h + raw_d + raw_a
-            p_h, p_a = raw_h / total_p, raw_a / total_p
-            diff = abs(p_h - p_a) * 100
-            
+            diff = abs((raw_h/total_p) - (raw_a/total_p)) * 100
             if diff > 30: continue
         except (KeyError, ZeroDivisionError, TypeError):
             continue
@@ -196,17 +185,13 @@ async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("😕 Подходящих матчей на завтра не найдено.")
     else:
         results.sort(key=lambda x: x["score"], reverse=True)
-        msg = "📊 <b>Результаты сканирования:</b>\n\n"
+        msg = "📊 <b>Результаты:</b>\n\n"
         for r in results:
             emoji = "🟢" if r["verdict"] == "SIGNAL" else "🟡"
-            msg += f"{emoji} <b>{r['match']}</b>\n"
-            msg += f"   Кэф ОЗ: {r['odds']} | Скоринг: {r['score']}\n"
-            msg += f"   {r['stats']}\n\n"
-        
-        msg += "⚠️ <i>Перед ставкой проверьте составы!</i>"
+            msg += f"{emoji} <b>{r['match']}</b>\n   Кэф ОЗ: {r['odds']} | Скоринг: {r['score']}\n   {r['stats']}\n\n"
         await update.message.reply_text(msg, parse_mode="HTML")
 
-# ---------- Тест API (для дебага) ----------
+# ---------- Тест API ----------
 async def test_api(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Тестирую API...")
     data = await fetch_json("/Games/list", {"Date": "2026-11-06", "TimeZone": 3})
@@ -214,19 +199,17 @@ async def test_api(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Ошибка: {data['error']}")
     else:
         count = len(data.get("data", []))
-        await update.message.reply_text(f"✅ Успех! Получено {count} матчей. Ключ рабочий.")
+        await update.message.reply_text(f"✅ Успех! Получено {count} матчей.")
 
 # ---------- Запуск ----------
 def main():
-    if not BOT_TOKEN:
-        raise SystemExit("BOT_TOKEN не задан!")
-        
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("⚽ Привет! Отправь /scan, и я найду матчи на ОЗ на завтра.")))
+    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("⚽ Привет! Отправь /scan, и я найду матчи.")))
     app.add_handler(CommandHandler("scan", scan_matches))
     app.add_handler(CommandHandler("testapi", test_api))
     
-    logger.info("Bot started (requests mode)")
+    # ВОТ ЭТА СТРОЧКА ПОКАЖЕТ, ЧТО КОД ОБНОВИЛСЯ
+    logger.info("Bot started (requests mode)") 
     app.run_polling()
 
 if __name__ == "__main__":
