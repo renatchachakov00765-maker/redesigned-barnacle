@@ -83,7 +83,8 @@ def fetch_1x2_odds_sync():
     return odds_map
 
 def get_team_stats_sync(team_id, is_home):
-    data = fetch_data(f"{API_BASE}/events/", {"team_id": team_id, "limit": 30})
+    # Увеличили лимит до 50, чтобы точно найти 10 домашних/гостевых
+    data = fetch_data(f"{API_BASE}/events/", {"team_id": team_id, "limit": 50})
     if isinstance(data, dict) and "error" in data: return None
     matches = data if isinstance(data, list) else []
     
@@ -134,7 +135,7 @@ def get_team_stats_sync(team_id, is_home):
     }
 
 async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 Ищу матчи (смарт-скоринг)...")
+    await update.message.reply_text("🔍 Сканирую (с отчетом об отсеве)...")
 
     try:
         leagues_map = await asyncio.to_thread(fetch_leagues_map)
@@ -161,20 +162,38 @@ async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 except: pass
 
         candidates = []
+        upcoming_count = 0
+        bad_odds_count = 0
+        bad_league_count = 0
+
         for event in events:
             if not isinstance(event, dict): continue
+            
+            # --- ЖЕСТКИЙ ФИЛЬТР ПО СТАТУСУ (Только предстоящие) ---
+            status = str(event.get("status") or "").lower()
+            if status not in ["notstarted", "scheduled", "1", "2", "upcoming"]:
+                continue # Пропускаем завершенные и лайв
+                
+            upcoming_count += 1
+
             eid = event.get("id")
             league_id = event.get("league_id")
             league_name = leagues_map.get(league_id, f"Лига ID {league_id}")
             
-            if any(kw in league_name.lower() for kw in BLACKLIST_KEYWORDS): continue
+            if any(kw in league_name.lower() for kw in BLACKLIST_KEYWORDS):
+                bad_league_count += 1
+                continue
+
             if eid not in btts_map: continue
+            
             odds = btts_map[eid]
-            if not (1.40 <= odds <= 2.20): continue
+            if not (1.40 <= odds <= 2.20):
+                bad_odds_count += 1
+                continue
             
             candidates.append((event, odds, league_name))
 
-        await update.message.reply_text(f"🎯 Отобрано {len(candidates)} матчей по кэфам. Проверяю форму...")
+        await update.message.reply_text(f"📅 Всего в API: {len(events)}. Предстоящих: {upcoming_count}. Отсеяно лиг: {bad_league_count}. Отсеяно по кэфам: {bad_odds_count}. Осталось кандидатов: {len(candidates)}.")
 
         signals = []
         watchlist = []
@@ -226,15 +245,13 @@ async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "btts": f"ОЗ {h_stats['btts_pct']:.0f}%/{a_stats['btts_pct']:.0f}%"
             }
 
-            # СМАРТ-СИГНАЛ: Высокий тотал = прокси xG
             if avg >= 2.6 and h_stats["btts_pct"] >= 60 and a_stats["btts_pct"] >= 60:
                 signals.append(item)
             else:
                 watchlist.append(item)
 
-        # Вывод
         if not signals and not watchlist:
-            await update.message.reply_text("😕 Подходящих матчей не найдено.")
+            await update.message.reply_text("😕 Подходящих матчей не найдено (все отсеялись по статистике).")
         else:
             msg = ""
             if signals:
@@ -249,7 +266,7 @@ async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if watchlist:
                 watchlist.sort(key=lambda x: x["score"], reverse=True)
                 msg += "🟡 <b>WATCHLIST (наблюдение):</b>\n\n"
-                for r in watchlist[:5]: # Только топ-5, чтобы не засорять
+                for r in watchlist[:5]:
                     msg += f"<b>{r['match']}</b>\n"
                     msg += f"   ⏰ {r['time']} | {r['btts']} | Тотал: {r['avg']:.1f}\n\n"
             await update.message.reply_text(msg, parse_mode="HTML")
@@ -261,7 +278,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("⚽ Привет! Отправь /scan.")))
     app.add_handler(CommandHandler("scan", scan_matches))
-    logger.info("Bot started (Smart Scoring)")
+    logger.info("Bot started (Filtered Status + Stats Report)")
     app.run_polling()
 
 if __name__ == "__main__":
