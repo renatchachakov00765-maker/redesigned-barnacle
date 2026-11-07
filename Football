@@ -36,7 +36,6 @@ def init_db():
                   event_date TEXT, status TEXT, result TEXT, message_id INTEGER, bet_type TEXT DEFAULT 'OZ')''')
     c.execute('''CREATE TABLE IF NOT EXISTS messages
                  (message_id INTEGER PRIMARY KEY, text TEXT)''')
-    # Таблицы кэша
     c.execute('''CREATE TABLE IF NOT EXISTS team_stats_cache
                  (team_id INTEGER, is_home INTEGER, date TEXT, 
                   btts_pct REAL, scored_count INTEGER, clean_count INTEGER, 
@@ -111,7 +110,7 @@ def extract_time(event):
     if date_val:
         try:
             dt = datetime.fromisoformat(str(date_val).replace("Z", "+00:00"))
-            dt_local = dt + timedelta(hours=4) # Ижевск
+            dt_local = dt + timedelta(hours=4)
             return dt_local.strftime("%d.%m %H:%M")
         except: return str(date_val)[:16].replace("T", " ")
     return "Скрыто"
@@ -168,7 +167,7 @@ def get_team_stats_sync(team_id, is_home):
 
     return result
 
-# --- Логика для Должников с КЭШИРОВАНИЕМ ---
+# --- Логика для Должников ---
 def check_debtor_status_sync(team_id):
     today = datetime.now().strftime("%Y-%m-%d")
     conn = sqlite3.connect(DB_PATH)
@@ -178,8 +177,7 @@ def check_debtor_status_sync(team_id):
     cached = c.fetchone()
     if cached:
         conn.close()
-        if cached[0] == 1:
-            return {"sot": cached[1], "xg": cached[2]}
+        if cached[0] == 1: return {"sot": cached[1], "xg": cached[2]}
         return False
     conn.close()
 
@@ -220,8 +218,7 @@ def check_debtor_status_sync(team_id):
         conn.commit()
         conn.close()
         
-        if is_debtor:
-            return {"sot": sot, "xg": xg}
+        if is_debtor: return {"sot": sot, "xg": xg}
             
     return False
 
@@ -237,24 +234,21 @@ def get_main_keyboard():
 async def start_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("⚽ <b>Главное меню:</b>", reply_markup=get_main_keyboard(), parse_mode="HTML")
 
-# --- Сканер (с отчетом, лимит 40 и поиском ВСЕХ кэфов) ---
+# --- Сканер по чистой статистике (без зависимости от кэфов) ---
 async def scan_all_markets(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("🔍 Сканирую (запрашиваю все доступные кэфы)...")
+    await update.effective_message.reply_text("🔍 Сканирую матчи по чистой статистике...")
     
     try:
         leagues_map = await asyncio.to_thread(fetch_leagues_map)
         events = await asyncio.to_thread(fetch_all_events_sync)
         
-        # Запрашиваем ВСЕ кэфы без фильтра
+        # Пытаемся достать хоть какие-то кэфы (для справки)
         all_odds = await asyncio.to_thread(fetch_data, f"{API_BASE}/odds/", {"limit": 1000})
-        
         btts_map = {}
         for row in all_odds:
             if not isinstance(row, dict): continue
             outcome = str(row.get("outcome") or row.get("name") or row.get("label") or "").lower()
             market_name = str(row.get("marketName") or row.get("market") or "").lower()
-            
-            # Ищем BTTS в любом виде
             if ("btts" in market_name or "both" in market_name) and outcome in ["yes", "да", "1", "over", "gg"]:
                 eid = row.get("event_id") or row.get("event") or row.get("match_id")
                 price = row.get("decimal_odds") or row.get("odds") or row.get("price") or row.get("value")
@@ -265,8 +259,6 @@ async def scan_all_markets(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     except: pass
 
         total_events = len([e for e in events if str(e.get("status")).lower() in ["notstarted", "scheduled"]])
-        drop_league = 0
-        drop_no_odds = 0
         
         candidates = []
         for event in events:
@@ -275,15 +267,8 @@ async def scan_all_markets(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             eid = event.get("id")
             league_name = leagues_map.get(event.get("league_id"), "")
             
-            if any(kw in league_name.lower() for kw in BLACKLIST_KEYWORDS): 
-                drop_league += 1
-                continue
-                
-            if eid not in btts_map:
-                drop_no_odds += 1
-                continue
-                
-            candidates.append((event, league_name, btts_map[eid]))
+            if any(kw in league_name.lower() for kw in BLACKLIST_KEYWORDS): continue
+            candidates.append((event, league_name, btts_map.get(eid, 0.0)))
 
         oz_signals = []
         itb_signals = []
@@ -310,14 +295,15 @@ async def scan_all_markets(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
             analyzed += 1
             avg_total = (h_stats["avg_total"] + a_stats["avg_total"]) / 2
+            odds_text = f"💰 Кэф ОЗ: {oz_odds:.2f}" if oz_odds > 0 else "💰 Кэф: уточните в БК"
 
             # 1. ОЗ
             if (h_stats["btts_pct"] >= 55 and a_stats["btts_pct"] >= 55 and 
                 h_stats["avg_scored"] >= 1.0 and a_stats["avg_scored"] >= 1.0 and
                 h_stats["avg_conceded"] >= 1.0 and a_stats["avg_conceded"] >= 1.0 and
-                avg_total >= 2.2 and (1.40 <= oz_odds <= 2.20)):
+                avg_total >= 2.2):
                 
-                oz_signals.append({"id": eid, "match": match_name, "time": time_str, "league": league_name, "odds": oz_odds, "date": event.get("event_date"), "bet_type": "OZ", "text": f"💰 Кэф ОЗ: {oz_odds:.2f} | Тотал: {avg_total:.1f}"})
+                oz_signals.append({"id": eid, "match": match_name, "time": time_str, "league": league_name, "odds": oz_odds, "date": event.get("event_date"), "bet_type": "OZ", "text": f"{odds_text} | Тотал: {avg_total:.1f}"})
 
             # 2. ТБ 1.5
             if avg_total >= 2.2 and h_stats["avg_scored"] >= 1.0 and a_stats["avg_scored"] >= 1.0:
@@ -333,25 +319,20 @@ async def scan_all_markets(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 itb_signals.append({"id": eid, "match": match_name, "time": time_str, "league": league_name, "date": event.get("event_date"), "bet_type": "ITB_AWAY", "text": f"ИТБ 0.5 на {a_name} (xG {a_debtor['xg']:.1f}, {a_debtor['sot']} удара)"})
 
         footer = (
-            f"\n📊 <b>Отчет об отсеве:</b>\n"
-            f"• Всего предстоящих: {total_events}\n"
-            f"• Отсеяно по лигам: {drop_league}\n"
-            f"• Без кэфов на ОЗ в API: {drop_no_odds}\n"
-            f"• Проанализировано: {analyzed}\n"
-            f"• Без истории матчей: {no_history}"
+            f"\n📊 <i>Проверено событий: {total_events}. Проанализировано: {analyzed}. Без истории: {no_history}.</i>"
         )
 
         if not oz_signals and not itb_signals and not tb_signals:
-            await update.effective_message.reply_text(f"😕 Подходящих матчей не найдено.{footer}", reply_markup=get_main_keyboard(), parse_mode="HTML")
+            await update.effective_message.reply_text(f"😕 Подходящих матчей по статистике не найдено.{footer}", reply_markup=get_main_keyboard(), parse_mode="HTML")
             return
 
-        msg = "📋 <b>Результаты сканирования:</b>\n"
+        msg = "📋 <b>Результаты статистического анализа:</b>\n"
         
         if oz_signals:
             msg += "\n🟢 <b>Рынок: Обе забьют (ОЗ)</b>\n"
             for r in oz_signals:
                 msg += f"• <b>{r['match']}</b>\n  ⏰ {r['time']} | 🏆 {r['league']}\n  {r['text']}\n"
-                save_signal(r["id"], r["match"], 1.0, r["date"], 0, r["bet_type"])
+                save_signal(r["id"], r["match"], r["odds"], r["date"], 0, r["bet_type"])
 
         if itb_signals:
             msg += "\n🧠 <b>Рынок: Индивидуальный тотал (ИТБ 0.5)</b>\n"
@@ -402,17 +383,11 @@ async def update_results(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 hg = data.get("home_score") or 0
                 ag = data.get("away_score") or 0
                 
-                # Логика проверки в зависимости от рынка
-                if bet_type == "OZ":
-                    res = "win" if (hg > 0 and ag > 0) else "loss"
-                elif bet_type == "TB1.5":
-                    res = "win" if (hg + ag) > 1.5 else "loss"
-                elif bet_type == "ITB_HOME":
-                    res = "win" if hg > 0 else "loss"
-                elif bet_type == "ITB_AWAY":
-                    res = "win" if ag > 0 else "loss"
-                else:
-                    res = "win" if (hg > 0 or ag > 0) else "loss"
+                if bet_type == "OZ": res = "win" if (hg > 0 and ag > 0) else "loss"
+                elif bet_type == "TB1.5": res = "win" if (hg + ag) > 1.5 else "loss"
+                elif bet_type == "ITB_HOME": res = "win" if hg > 0 else "loss"
+                elif bet_type == "ITB_AWAY": res = "win" if ag > 0 else "loss"
+                else: res = "win" if (hg > 0 or ag > 0) else "loss"
                     
                 update_signal_result(event_id, "finished", res)
                 updated_count += 1
@@ -479,7 +454,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_menu))
     app.add_handler(CallbackQueryHandler(button_handler))
-    logger.info("Bot started (Full Caching + Limits 40 + All Odds)")
+    logger.info("Bot started (Pure Stats Mode)")
     app.run_polling()
 
 if __name__ == "__main__":
