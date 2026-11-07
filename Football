@@ -31,11 +31,23 @@ BLACKLIST_KEYWORDS = [
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    # Основная таблица сигналов
     c.execute('''CREATE TABLE IF NOT EXISTS signals
                  (event_id INTEGER PRIMARY KEY, match_name TEXT, odds REAL, 
                   event_date TEXT, status TEXT, result TEXT, message_id INTEGER, bet_type TEXT DEFAULT 'OZ')''')
+    # Таблица сообщений
     c.execute('''CREATE TABLE IF NOT EXISTS messages
                  (message_id INTEGER PRIMARY KEY, text TEXT)''')
+    # ТАБЛИЦА КЭША СТАТИСТИКИ
+    c.execute('''CREATE TABLE IF NOT EXISTS team_stats_cache
+                 (team_id INTEGER, is_home INTEGER, date TEXT, 
+                  btts_pct REAL, scored_count INTEGER, clean_count INTEGER, 
+                  avg_scored REAL, avg_conceded REAL, avg_total REAL, n INTEGER,
+                  PRIMARY KEY (team_id, is_home, date))''')
+    # ТАБЛИЦА КЭША ДОЛЖНИКОВ
+    c.execute('''CREATE TABLE IF NOT EXISTS debtor_cache
+                 (team_id INTEGER, date TEXT, is_debtor INTEGER, sot INTEGER, xg REAL,
+                  PRIMARY KEY (team_id, date))''')
     conn.commit()
     conn.close()
 
@@ -102,43 +114,85 @@ def extract_time(event):
     if date_val:
         try:
             dt = datetime.fromisoformat(str(date_val).replace("Z", "+00:00"))
-            dt_local = dt + timedelta(hours=4) # Ижевск UTC+4
+            dt_local = dt + timedelta(hours=4) # Ижевск
             return dt_local.strftime("%d.%m %H:%M")
         except: return str(date_val)[:16].replace("T", " ")
     return "Скрыто"
 
-# --- Статистика (ИЗМЕНЕНО НА 6 МАТЧЕЙ) ---
+# --- Статистика с КЭШИРОВАНИЕМ ---
 def get_team_stats_sync(team_id, is_home):
+    today = datetime.now().strftime("%Y-%m-%d")
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    # 1. Проверяем кэш на сегодня
+    c.execute("SELECT btts_pct, scored_count, clean_count, avg_scored, avg_conceded, avg_total, n FROM team_stats_cache WHERE team_id=? AND is_home=? AND date=?", 
+              (team_id, int(is_home), today))
+    cached = c.fetchone()
+    if cached:
+        conn.close()
+        return {
+            "btts_pct": cached[0], "scored_count": cached[1], "clean_count": cached[2], 
+            "avg_scored": cached[3], "avg_conceded": cached[4], "avg_total": cached[5], "n": cached[6]
+        }
+    
+    conn.close() # Закрываем перед запросом
+
+    # 2. Если нет в кэше — идем в API
     data = fetch_data(f"{API_BASE}/events/", {"team_id": team_id, "limit": 30})
     if isinstance(data, dict) and "error" in data: return None
     matches = data if isinstance(data, list) else []
     finished = [m for m in matches if str(m.get("status")).lower() in ["finished", "ft", "ended", "3"]]
     venue_matches = [m for m in finished if (is_home and m.get("home_team_id") == team_id) or (not is_home and m.get("away_team_id") == team_id)]
 
-    if len(venue_matches) < 3: return None # Снизили минимальный порог до 3 игр
+    if len(venue_matches) < 3: return None 
 
-    # БЕРЕМ ПОСЛЕДНИЕ 6 МАТЧЕЙ ВМЕСТО 10
     matches_to_analyze = venue_matches[:6]
-    
     btts, scored_count, clean_count = 0, 0, 0
     goals_scored, goals_conceded = 0, 0
     n = len(matches_to_analyze)
 
     for m in matches_to_analyze:
         hg, ag = m.get("home_score") or 0, m.get("away_score") or 0
-        s, c = (hg, ag) if m.get("home_team_id") == team_id else (ag, hg)
-        goals_scored += s; goals_conceded += c
-        if s > 0 and c > 0: btts += 1
+        s, c_goals = (hg, ag) if m.get("home_team_id") == team_id else (ag, hg)
+        goals_scored += s; goals_conceded += c_goals
+        if s > 0 and c_goals > 0: btts += 1
         if s > 0: scored_count += 1
-        if c == 0: clean_count += 1
+        if c_goals == 0: clean_count += 1
 
-    return {
+    result = {
         "btts_pct": (btts/n)*100, "scored_count": scored_count, "clean_count": clean_count, 
         "avg_scored": goals_scored/n, "avg_conceded": goals_conceded/n, "avg_total": (goals_scored+goals_conceded)/n, "n": n
     }
 
-# --- Логика для Должников (xG / Удары) ---
+    # 3. Сохраняем в кэш
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO team_stats_cache VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              (team_id, int(is_home), today, result["btts_pct"], result["scored_count"], result["clean_count"], result["avg_scored"], result["avg_conceded"], result["avg_total"], result["n"]))
+    conn.commit()
+    conn.close()
+
+    return result
+
+# --- Логика для Должников с КЭШИРОВАНИЕМ ---
 def check_debtor_status_sync(team_id):
+    today = datetime.now().strftime("%Y-%m-%d")
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    # 1. Проверяем кэш на сегодня
+    c.execute("SELECT is_debtor, sot, xg FROM debtor_cache WHERE team_id=? AND date=?", (team_id, today))
+    cached = c.fetchone()
+    if cached:
+        conn.close()
+        if cached[0] == 1:
+            return {"sot": cached[1], "xg": cached[2]}
+        return False
+        
+    conn.close()
+
+    # 2. Если нет в кэше — идем в API
     data = fetch_data(f"{API_BASE}/events/", {"team_id": team_id, "limit": 10})
     if isinstance(data, dict) and "error" in data: return False
     matches = data if isinstance(data, list) else []
@@ -152,8 +206,16 @@ def check_debtor_status_sync(team_id):
     ag = last_match.get("away_score") or 0
     goals_scored = hg if last_match.get("home_team_id") == team_id else ag
     
-    if goals_scored > 0: return False 
+    if goals_scored > 0: 
+        # Сохраняем в кэш, что не должник
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO debtor_cache VALUES (?, ?, ?, ?, ?)", (team_id, today, 0, 0, 0.0))
+        conn.commit()
+        conn.close()
+        return False 
 
+    # Идем в статистику матча
     stats_data = fetch_data(f"{API_BASE}/events/{match_id}/stats/")
     if isinstance(stats_data, dict) and "error" not in stats_data:
         xg = stats_data.get("expectedGoalsHome") if last_match.get("home_team_id") == team_id else stats_data.get("expectedGoalsAway")
@@ -162,15 +224,24 @@ def check_debtor_status_sync(team_id):
         xg = float(xg) if xg else 0.0
         sot = int(sot) if sot else 0
         
-        if xg >= 1.2 or sot >= 4:
+        is_debtor = 1 if (xg >= 1.2 or sot >= 4) else 0
+        
+        # 3. Сохраняем в кэш
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO debtor_cache VALUES (?, ?, ?, ?, ?)", (team_id, today, is_debtor, sot, xg))
+        conn.commit()
+        conn.close()
+        
+        if is_debtor:
             return {"sot": sot, "xg": xg}
+            
     return False
 
 # --- Меню ---
 def get_main_keyboard():
     keyboard = [
-        [InlineKeyboardButton("🔍 Сканировать ОЗ (Обе забьют)", callback_data="cmd_scan")],
-        [InlineKeyboardButton("🧠 Должники (xG/Удары)", callback_data="cmd_debtors")],
+        [InlineKeyboardButton("🔍 Сканировать матчи (Все рынки)", callback_data="cmd_scan_all")],
         [InlineKeyboardButton("🔄 Обновить результаты", callback_data="cmd_update")],
         [InlineKeyboardButton("📁 Экспорт в CSV", callback_data="cmd_export")]
     ]
@@ -179,14 +250,15 @@ def get_main_keyboard():
 async def start_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("⚽ <b>Главное меню:</b>", reply_markup=get_main_keyboard(), parse_mode="HTML")
 
-# --- Сканер ОЗ ---
-async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("🔍 Ищу матчи на ОЗ (анализ последних 6 матчей)...")
+# --- Сканер (без жестких лимитов, т.к. работает кэш) ---
+async def scan_all_markets(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text("🔍 Сканирую матчи (с кэшированием статистики)...")
+    
     try:
         leagues_map = await asyncio.to_thread(fetch_leagues_map)
         events = await asyncio.to_thread(fetch_all_events_sync)
-        btts_list = await asyncio.to_thread(fetch_data, f"{API_BASE}/odds/", {"market": "btts", "limit": 1000})
         
+        btts_list = await asyncio.to_thread(fetch_data, f"{API_BASE}/odds/", {"market": "btts", "limit": 1000})
         btts_map = {}
         for row in btts_list:
             if not isinstance(row, dict): continue
@@ -207,99 +279,93 @@ async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             eid = event.get("id")
             league_name = leagues_map.get(event.get("league_id"), "")
             if any(kw in league_name.lower() for kw in BLACKLIST_KEYWORDS): continue
-            if eid not in btts_map: continue
-            odds = btts_map[eid]
-            if not (1.40 <= odds <= 2.20): continue
-            candidates.append((event, odds, league_name))
+            candidates.append((event, league_name))
 
-        signals = []
+        oz_signals = []
+        itb_signals = []
+        tb_signals = []
+        
         total_checked = len(candidates)
         no_history = 0
-        failed_stats = 0
 
-        for event, odds, league_name in candidates:
+        # Увеличили лимит до 20 матчей, так как кэш экономит запросы
+        for idx, (event, league_name) in enumerate(candidates[:20]):
             h_id, a_id = event.get("home_team_id"), event.get("away_team_id")
             h_name, a_name = event.get("home_team"), event.get("away_team")
             match_name = f"{h_name} — {a_name}"
             time_str = extract_time(event)
+            eid = event.get("id")
             
+            # Небольшая пауза только для новых запросов
+            await asyncio.sleep(0.5)
+
             h_stats = await asyncio.to_thread(get_team_stats_sync, h_id, True)
             a_stats = await asyncio.to_thread(get_team_stats_sync, a_id, False)
+            
             if not h_stats or not a_stats:
                 no_history += 1
                 continue
 
             avg_total = (h_stats["avg_total"] + a_stats["avg_total"]) / 2
-            
-            # ФИЛЬТРЫ (смягченные)
-            if (h_stats["btts_pct"] < 55 or a_stats["btts_pct"] < 55 or 
-                h_stats["avg_scored"] < 1.0 or a_stats["avg_scored"] < 1.0 or
-                h_stats["avg_conceded"] < 1.0 or a_stats["avg_conceded"] < 1.0 or
-                avg_total < 2.2):
-                failed_stats += 1
-                continue
+            oz_odds = btts_map.get(eid, 0)
 
-            signals.append({"id": event.get("id"), "match": match_name, "time": time_str, "league": league_name, "odds": odds, "avg": avg_total, "date": event.get("event_date")})
+            # --- 1. РЫНОК ОЗ ---
+            if (h_stats["btts_pct"] >= 55 and a_stats["btts_pct"] >= 55 and 
+                h_stats["avg_scored"] >= 1.0 and a_stats["avg_scored"] >= 1.0 and
+                h_stats["avg_conceded"] >= 1.0 and a_stats["avg_conceded"] >= 1.0 and
+                avg_total >= 2.2 and (1.40 <= oz_odds <= 2.20)):
+                
+                oz_signals.append({"id": eid, "match": match_name, "time": time_str, "league": league_name, "odds": oz_odds, "date": event.get("event_date"), "bet_type": "OZ", "text": f"💰 Кэф ОЗ: {oz_odds:.2f} | Тотал: {avg_total:.1f}"})
 
-        footer = f"\n📊 <i>Проверено по кэфам: {total_checked}. Без истории: {no_history}. Не прошли по цифрам: {failed_stats}.</i>"
+            # --- 2. РЫНОК ТБ 1.5 ---
+            if avg_total >= 2.5 and h_stats["avg_scored"] >= 1.0 and a_stats["avg_scored"] >= 1.0:
+                tb_signals.append({"id": eid, "match": match_name, "time": time_str, "league": league_name, "date": event.get("event_date"), "bet_type": "TB1.5", "text": f"Средний тотал: {avg_total:.1f}"})
 
-        if not signals:
-            await update.effective_message.reply_text(f"😕 Сигналов на ОЗ нет.{footer}", reply_markup=get_main_keyboard(), parse_mode="HTML")
-        else:
-            signals.sort(key=lambda x: x["avg"], reverse=True)
-            msg = "🟢 <b>Новые сигналы (ОЗ):</b>\n\n"
-            for r in signals:
-                msg += f"<b>{r['match']}</b>\n   ⏰ {r['time']} | 🏆 {r['league']}\n   💰 Кэф ОЗ: {r['odds']:.2f} | Тотал: {r['avg']:.1f}\n\n"
-            
-            msg += footer
-            
-            sent_msg = await update.effective_message.reply_text(msg, parse_mode="HTML", reply_markup=get_main_keyboard())
-            save_message(sent_msg.message_id, msg)
-            for r in signals: save_signal(r["id"], r["match"], r["odds"], r["date"], sent_msg.message_id, "OZ")
-
-    except Exception as e:
-        await update.effective_message.reply_text(f"❌ Ошибка: {repr(e)}", reply_markup=get_main_keyboard())
-
-# --- Сканер "Должники" ---
-async def scan_debtors(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("🧠 Ищу команды-должники (0 голов, но много ударов/xG)...")
-    try:
-        leagues_map = await asyncio.to_thread(fetch_leagues_map)
-        events = await asyncio.to_thread(fetch_all_events_sync)
-        upcoming = [e for e in events if str(e.get("status")).lower() in ["notstarted", "scheduled"]][:20]
-        
-        signals = []
-        for event in upcoming:
-            h_id, a_id = event.get("home_team_id"), event.get("away_team_id")
-            h_name, a_name = event.get("home_team"), event.get("away_team")
-            match_name = f"{h_name} — {a_name}"
-            time_str = extract_time(event)
-            league_name = leagues_map.get(event.get("league_id"), "")
-            
-            if any(kw in league_name.lower() for kw in BLACKLIST_KEYWORDS): continue
-
+            # --- 3. РЫНОК ИТБ 0.5 ---
             h_debtor = await asyncio.to_thread(check_debtor_status_sync, h_id)
-            if h_debtor:
-                a_stats = await asyncio.to_thread(get_team_stats_sync, a_id, False)
-                if a_stats and a_stats["avg_conceded"] >= 1.0:
-                    signals.append({"match": match_name, "time": time_str, "league": league_name, "team": f"ИТБ 0.5 на {h_name}", "reason": f"В прошлом матче: {h_debtor['sot']} удара в створ, xG {h_debtor['xg']:.1f}. Соперник пропускает {a_stats['avg_conceded']:.1f}", "bet_type": "ITB_HOME"})
-
-            a_debtor = await asyncio.to_thread(check_debtor_status_sync, a_id)
-            if a_debtor:
-                h_stats = await asyncio.to_thread(get_team_stats_sync, h_id, True)
-                if h_stats and h_stats["avg_conceded"] >= 1.0:
-                    signals.append({"match": match_name, "time": time_str, "league": league_name, "team": f"ИТБ 0.5 на {a_name}", "reason": f"В прошлом матче: {a_debtor['sot']} удара в створ, xG {a_debtor['xg']:.1f}. Соперник пропускает {h_stats['avg_conceded']:.1f}", "bet_type": "ITB_AWAY"})
-
-        if not signals:
-            await update.effective_message.reply_text("😕 Команд-должников с подходящими соперниками не найдено.", reply_markup=get_main_keyboard())
-        else:
-            msg = "🧠 <b>Найдены команды-должники (Рекомендация ИТБ 0.5):</b>\n\n"
-            for r in signals:
-                msg += f"<b>{r['match']}</b>\n   ⏰ {r['time']} | 🏆 {r['league']}\n   🎯 {r['team']}\n   📊 {r['reason']}\n\n"
+            if h_debtor and a_stats["avg_conceded"] >= 1.0:
+                itb_signals.append({"id": eid, "match": match_name, "time": time_str, "league": league_name, "date": event.get("event_date"), "bet_type": "ITB", "text": f"ИТБ 0.5 на {h_name} (xG {h_debtor['xg']:.1f}, {h_debtor['sot']} удара)"})
             
-            sent_msg = await update.effective_message.reply_text(msg, parse_mode="HTML", reply_markup=get_main_keyboard())
-            save_message(sent_msg.message_id, msg)
-            for r in signals: save_signal(0, r["match"], 1.0, datetime.now().isoformat(), sent_msg.message_id, r["bet_type"])
+            a_debtor = await asyncio.to_thread(check_debtor_status_sync, a_id)
+            if a_debtor and h_stats["avg_conceded"] >= 1.0:
+                itb_signals.append({"id": eid, "match": match_name, "time": time_str, "league": league_name, "date": event.get("event_date"), "bet_type": "ITB", "text": f"ИТБ 0.5 на {a_name} (xG {a_debtor['xg']:.1f}, {a_debtor['sot']} удара)"})
+
+        footer = f"\n📊 <i>Проверено матчей: {total_checked}. Проанализировано: до 20. Без истории: {no_history}.</i>"
+
+        if not oz_signals and not itb_signals and not tb_signals:
+            await update.effective_message.reply_text(f"😕 Сегодня нет подходящих матчей.{footer}", reply_markup=get_main_keyboard(), parse_mode="HTML")
+            return
+
+        msg = "📋 <b>Результаты сканирования:</b>\n"
+        
+        if oz_signals:
+            msg += "\n🟢 <b>Рынок: Обе забьют (ОЗ)</b>\n"
+            for r in oz_signals:
+                msg += f"• <b>{r['match']}</b>\n  ⏰ {r['time']} | 🏆 {r['league']}\n  {r['text']}\n"
+                save_signal(r["id"], r["match"], 1.0, r["date"], 0, r["bet_type"])
+
+        if itb_signals:
+            msg += "\n🧠 <b>Рынок: Индивидуальный тотал (ИТБ 0.5)</b>\n"
+            for r in itb_signals:
+                msg += f"• <b>{r['match']}</b>\n  ⏰ {r['time']} | 🏆 {r['league']}\n  {r['text']}\n"
+                save_signal(r["id"], r["match"], 1.0, r["date"], 0, r["bet_type"])
+
+        if tb_signals:
+            msg += "\n🛡 <b>Рынок: Тотал Больше 1.5</b>\n"
+            for r in tb_signals:
+                msg += f"• <b>{r['match']}</b>\n  ⏰ {r['time']} | 🏆 {r['league']}\n  {r['text']}\n"
+                save_signal(r["id"], r["match"], 1.0, r["date"], 0, r["bet_type"])
+
+        msg += footer
+        
+        sent_msg = await update.effective_message.reply_text(msg, parse_mode="HTML", reply_markup=get_main_keyboard())
+        
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("UPDATE signals SET message_id=? WHERE message_id=0", (sent_msg.message_id,))
+        conn.commit()
+        conn.close()
+        save_message(sent_msg.message_id, msg)
 
     except Exception as e:
         await update.effective_message.reply_text(f"❌ Ошибка: {repr(e)}", reply_markup=get_main_keyboard())
@@ -318,7 +384,7 @@ async def update_results(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     updated_count = 0
 
     for event_id, match_name, msg_id, bet_type in pending:
-        if event_id == 0 or not msg_id: continue 
+        if not msg_id: continue 
         
         data = await asyncio.to_thread(fetch_data, f"{API_BASE}/events/{event_id}/")
         if isinstance(data, dict) and "error" not in data:
@@ -329,7 +395,9 @@ async def update_results(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 
                 if bet_type == "OZ":
                     res = "win" if (hg > 0 and ag > 0) else "loss"
-                else:
+                elif bet_type == "TB1.5":
+                    res = "win" if (hg + ag) > 1.5 else "loss"
+                elif bet_type == "ITB":
                     res = "win" if (hg > 0 or ag > 0) else "loss"
                     
                 update_signal_result(event_id, "finished", res)
@@ -367,7 +435,7 @@ async def update_results(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def export_data(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT event_id, match_name, odds, event_date, status, result, bet_type FROM signals")
+    c.execute("SELECT event_id, match_name, bet_type, event_date, status, result FROM signals")
     rows = c.fetchall()
     conn.close()
 
@@ -378,7 +446,7 @@ async def export_data(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     filename = "btts_history.csv"
     with open(filename, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["ID", "Матч", "Кэф ОЗ", "Дата", "Статус", "Результат", "Тип ставки"])
+        writer.writerow(["ID Матча", "Матч", "Рынок", "Дата", "Статус", "Результат"])
         writer.writerows(rows)
 
     with open(filename, "rb") as f:
@@ -388,8 +456,7 @@ async def export_data(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.data == "cmd_scan": await scan_matches(update, ctx)
-    elif query.data == "cmd_debtors": await scan_debtors(update, ctx)
+    if query.data == "cmd_scan_all": await scan_all_markets(update, ctx)
     elif query.data == "cmd_update": await update_results(update, ctx)
     elif query.data == "cmd_export": await export_data(update, ctx)
 
@@ -398,7 +465,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_menu))
     app.add_handler(CallbackQueryHandler(button_handler))
-    logger.info("Bot started (6 Matches Window)")
+    logger.info("Bot started (Caching Mode)")
     app.run_polling()
 
 if __name__ == "__main__":
