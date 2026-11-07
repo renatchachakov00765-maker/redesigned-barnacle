@@ -237,27 +237,32 @@ def get_main_keyboard():
 async def start_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("⚽ <b>Главное меню:</b>", reply_markup=get_main_keyboard(), parse_mode="HTML")
 
-# --- Сканер (с отчетом и лимитом 40) ---
+# --- Сканер (с отчетом, лимит 40 и поиском ВСЕХ кэфов) ---
 async def scan_all_markets(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("🔍 Сканирую (с подробным отчетом, лимит 40 матчей)...")
+    await update.effective_message.reply_text("🔍 Сканирую (запрашиваю все доступные кэфы)...")
     
     try:
         leagues_map = await asyncio.to_thread(fetch_leagues_map)
         events = await asyncio.to_thread(fetch_all_events_sync)
         
-        btts_list = await asyncio.to_thread(fetch_data, f"{API_BASE}/odds/", {"market": "btts", "limit": 1000})
+        # Запрашиваем ВСЕ кэфы без фильтра
+        all_odds = await asyncio.to_thread(fetch_data, f"{API_BASE}/odds/", {"limit": 1000})
+        
         btts_map = {}
-        for row in btts_list:
+        for row in all_odds:
             if not isinstance(row, dict): continue
             outcome = str(row.get("outcome") or row.get("name") or row.get("label") or "").lower()
-            if outcome not in ["yes", "да", "1", "over", "gg"]: continue
-            eid = row.get("event_id") or row.get("event") or row.get("match_id")
-            price = row.get("decimal_odds") or row.get("odds") or row.get("price") or row.get("value")
-            if eid and price:
-                try:
-                    price = float(price)
-                    if eid not in btts_map or price > btts_map[eid]: btts_map[eid] = price
-                except: pass
+            market_name = str(row.get("marketName") or row.get("market") or "").lower()
+            
+            # Ищем BTTS в любом виде
+            if ("btts" in market_name or "both" in market_name) and outcome in ["yes", "да", "1", "over", "gg"]:
+                eid = row.get("event_id") or row.get("event") or row.get("match_id")
+                price = row.get("decimal_odds") or row.get("odds") or row.get("price") or row.get("value")
+                if eid and price:
+                    try:
+                        price = float(price)
+                        if eid not in btts_map or price > btts_map[eid]: btts_map[eid] = price
+                    except: pass
 
         total_events = len([e for e in events if str(e.get("status")).lower() in ["notstarted", "scheduled"]])
         drop_league = 0
@@ -306,7 +311,7 @@ async def scan_all_markets(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             analyzed += 1
             avg_total = (h_stats["avg_total"] + a_stats["avg_total"]) / 2
 
-            # --- 1. РЫНОК ОЗ ---
+            # 1. ОЗ
             if (h_stats["btts_pct"] >= 55 and a_stats["btts_pct"] >= 55 and 
                 h_stats["avg_scored"] >= 1.0 and a_stats["avg_scored"] >= 1.0 and
                 h_stats["avg_conceded"] >= 1.0 and a_stats["avg_conceded"] >= 1.0 and
@@ -314,23 +319,23 @@ async def scan_all_markets(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 
                 oz_signals.append({"id": eid, "match": match_name, "time": time_str, "league": league_name, "odds": oz_odds, "date": event.get("event_date"), "bet_type": "OZ", "text": f"💰 Кэф ОЗ: {oz_odds:.2f} | Тотал: {avg_total:.1f}"})
 
-            # --- 2. РЫНОК ТБ 1.5 (порог 2.2) ---
+            # 2. ТБ 1.5
             if avg_total >= 2.2 and h_stats["avg_scored"] >= 1.0 and a_stats["avg_scored"] >= 1.0:
                 tb_signals.append({"id": eid, "match": match_name, "time": time_str, "league": league_name, "date": event.get("event_date"), "bet_type": "TB1.5", "text": f"Средний тотал: {avg_total:.1f}"})
 
-            # --- 3. РЫНОК ИТБ 0.5 ---
+            # 3. ИТБ 0.5
             h_debtor = await asyncio.to_thread(check_debtor_status_sync, h_id)
             if h_debtor and a_stats["avg_conceded"] >= 1.0:
-                itb_signals.append({"id": eid, "match": match_name, "time": time_str, "league": league_name, "date": event.get("event_date"), "bet_type": "ITB", "text": f"ИТБ 0.5 на {h_name} (xG {h_debtor['xg']:.1f}, {h_debtor['sot']} удара)"})
+                itb_signals.append({"id": eid, "match": match_name, "time": time_str, "league": league_name, "date": event.get("event_date"), "bet_type": "ITB_HOME", "text": f"ИТБ 0.5 на {h_name} (xG {h_debtor['xg']:.1f}, {h_debtor['sot']} удара)"})
             
             a_debtor = await asyncio.to_thread(check_debtor_status_sync, a_id)
             if a_debtor and h_stats["avg_conceded"] >= 1.0:
-                itb_signals.append({"id": eid, "match": match_name, "time": time_str, "league": league_name, "date": event.get("event_date"), "bet_type": "ITB", "text": f"ИТБ 0.5 на {a_name} (xG {a_debtor['xg']:.1f}, {a_debtor['sot']} удара)"})
+                itb_signals.append({"id": eid, "match": match_name, "time": time_str, "league": league_name, "date": event.get("event_date"), "bet_type": "ITB_AWAY", "text": f"ИТБ 0.5 на {a_name} (xG {a_debtor['xg']:.1f}, {a_debtor['sot']} удара)"})
 
         footer = (
             f"\n📊 <b>Отчет об отсеве:</b>\n"
             f"• Всего предстоящих: {total_events}\n"
-            f"• Отсеяно по лигам (кубки/молодежки): {drop_league}\n"
+            f"• Отсеяно по лигам: {drop_league}\n"
             f"• Без кэфов на ОЗ в API: {drop_no_odds}\n"
             f"• Проанализировано: {analyzed}\n"
             f"• Без истории матчей: {no_history}"
@@ -397,11 +402,16 @@ async def update_results(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 hg = data.get("home_score") or 0
                 ag = data.get("away_score") or 0
                 
+                # Логика проверки в зависимости от рынка
                 if bet_type == "OZ":
                     res = "win" if (hg > 0 and ag > 0) else "loss"
                 elif bet_type == "TB1.5":
                     res = "win" if (hg + ag) > 1.5 else "loss"
-                elif bet_type == "ITB":
+                elif bet_type == "ITB_HOME":
+                    res = "win" if hg > 0 else "loss"
+                elif bet_type == "ITB_AWAY":
+                    res = "win" if ag > 0 else "loss"
+                else:
                     res = "win" if (hg > 0 or ag > 0) else "loss"
                     
                 update_signal_result(event_id, "finished", res)
@@ -469,7 +479,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_menu))
     app.add_handler(CallbackQueryHandler(button_handler))
-    logger.info("Bot started (Full Caching + Limits 40)")
+    logger.info("Bot started (Full Caching + Limits 40 + All Odds)")
     app.run_polling()
 
 if __name__ == "__main__":
