@@ -31,9 +31,10 @@ BLACKLIST_KEYWORDS = [
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    # Добавили колонку bet_type
     c.execute('''CREATE TABLE IF NOT EXISTS signals
                  (event_id INTEGER PRIMARY KEY, match_name TEXT, odds REAL, 
-                  event_date TEXT, status TEXT, result TEXT, message_id INTEGER)''')
+                  event_date TEXT, status TEXT, result TEXT, message_id INTEGER, bet_type TEXT DEFAULT 'OZ')''')
     c.execute('''CREATE TABLE IF NOT EXISTS messages
                  (message_id INTEGER PRIMARY KEY, text TEXT)''')
     conn.commit()
@@ -54,11 +55,11 @@ def get_message_text(message_id):
     conn.close()
     return row[0] if row else None
 
-def save_signal(event_id, match_name, odds, event_date, message_id):
+def save_signal(event_id, match_name, odds, event_date, message_id, bet_type="OZ"):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO signals (event_id, match_name, odds, event_date, status, result, message_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-              (event_id, match_name, odds, event_date, "pending", "pending", message_id))
+    c.execute("INSERT OR IGNORE INTO signals (event_id, match_name, odds, event_date, status, result, message_id, bet_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+              (event_id, match_name, odds, event_date, "pending", "pending", message_id, bet_type))
     conn.commit()
     conn.close()
 
@@ -107,25 +108,7 @@ def extract_time(event):
         except: return str(date_val)[:16].replace("T", " ")
     return "Скрыто"
 
-def fetch_1x2_odds_sync():
-    data = fetch_data(f"{API_BASE}/odds/", {"market": "1x2", "limit": 1000})
-    if isinstance(data, dict) and "error" in data: return {}
-    odds_map = {}
-    for row in data:
-        if not isinstance(row, dict): continue
-        eid = row.get("event_id") or row.get("event") or row.get("match_id")
-        outcome = str(row.get("outcome") or row.get("name") or row.get("label") or "").lower()
-        price = row.get("decimal_odds") or row.get("odds") or row.get("price") or row.get("value")
-        if eid and outcome and price:
-            if eid not in odds_map: odds_map[eid] = {}
-            try:
-                price = float(price)
-                if outcome in ["1", "home", "w1"]: odds_map[eid]["home"] = price
-                elif outcome in ["x", "draw"]: odds_map[eid]["draw"] = price
-                elif outcome in ["2", "away", "w2"]: odds_map[eid]["away"] = price
-            except: pass
-    return odds_map
-
+# --- Получение базовой статистики (Дом/Гости) ---
 def get_team_stats_sync(team_id, is_home):
     data = fetch_data(f"{API_BASE}/events/", {"team_id": team_id, "limit": 50})
     if isinstance(data, dict) and "error" in data: return None
@@ -136,45 +119,78 @@ def get_team_stats_sync(team_id, is_home):
     if len(venue_matches) < 4: return None 
 
     matches_to_analyze = venue_matches[:10]
-    btts, scored, clean, gs, gc = 0, 0, 0, 0, 0
+    btts, scored_count, clean_count = 0, 0, 0
+    goals_scored, goals_conceded = 0, 0
+    n = len(matches_to_analyze)
 
     for m in matches_to_analyze:
         hg, ag = m.get("home_score") or 0, m.get("away_score") or 0
         s, c = (hg, ag) if m.get("home_team_id") == team_id else (ag, hg)
-        gs += s; gc += c
+        goals_scored += s; goals_conceded += c
         if s > 0 and c > 0: btts += 1
-        if s > 0: scored += 1
-        if c == 0: clean += 1
+        if s > 0: scored_count += 1
+        if c == 0: clean_count += 1
 
-    n = len(matches_to_analyze)
-    return {"btts_pct": (btts/n)*100, "scored": scored, "clean": clean, "avg_total": (gs+gc)/n, "n": n}
+    return {
+        "btts_pct": (btts/n)*100, "scored_count": scored_count, "clean_count": clean_count, 
+        "avg_scored": goals_scored/n, "avg_conceded": goals_conceded/n, "avg_total": (goals_scored+goals_conceded)/n, "n": n
+    }
 
-# --- Меню с кнопками ---
+# --- ЛОГИКА ДЛЯ ДОЛЖНИКОВ (xG / Удары в створ) ---
+def check_debtor_status_sync(team_id):
+    """Проверяет последний матч команды. Если 0 голов, но >= 4 ударов в створ или xG >= 1.2 -> True"""
+    data = fetch_data(f"{API_BASE}/events/", {"team_id": team_id, "limit": 10})
+    if isinstance(data, dict) and "error" in data: return False
+    matches = data if isinstance(data, list) else []
+    finished = [m for m in matches if str(m.get("status")).lower() in ["finished", "ft", "ended", "3"]]
+    
+    if not finished: return False
+    last_match = finished[0] # Самый свежий матч
+    match_id = last_match.get("id")
+    
+    # Смотрим, сколько забила команда
+    hg = last_match.get("home_score") or 0
+    ag = last_match.get("away_score") or 0
+    goals_scored = hg if last_match.get("home_team_id") == team_id else ag
+    
+    if goals_scored > 0: return False # Если забила, то это не "должник"
+
+    # Если не забила - идем за статистикой ударов
+    stats_data = fetch_data(f"{API_BASE}/events/{match_id}/stats/")
+    if isinstance(stats_data, dict) and "error" not in stats_data:
+        # Пытаемся достать xG или удары в створ (поля могут называться по-разному)
+        xg = stats_data.get("expectedGoalsHome") if last_match.get("home_team_id") == team_id else stats_data.get("expectedGoalsAway")
+        sot = stats_data.get("shotsOnGoalHome") if last_match.get("home_team_id") == team_id else stats_data.get("shotsOnGoalAway")
+        
+        xg = float(xg) if xg else 0.0
+        sot = int(sot) if sot else 0
+        
+        if xg >= 1.2 or sot >= 4:
+            return {"sot": sot, "xg": xg, "missed_goals": 0}
+            
+    return False
+
+# --- Меню ---
 def get_main_keyboard():
     keyboard = [
-        [InlineKeyboardButton("🔍 Сканировать матчи", callback_data="cmd_scan")],
+        [InlineKeyboardButton("🔍 Сканировать ОЗ (Обе забьют)", callback_data="cmd_scan")],
+        [InlineKeyboardButton("🧠 Должники (xG/Удары)", callback_data="cmd_debtors")],
         [InlineKeyboardButton("🔄 Обновить результаты", callback_data="cmd_update")],
         [InlineKeyboardButton("📁 Экспорт в CSV", callback_data="cmd_export")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
 async def start_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "⚽ <b>Главное меню бота:</b>\n\nВыберите действие на кнопках ниже 👇",
-        reply_markup=get_main_keyboard(),
-        parse_mode="HTML"
-    )
+    await update.effective_message.reply_text("⚽ <b>Главное меню:</b>", reply_markup=get_main_keyboard(), parse_mode="HTML")
 
-# --- Основной сканер ---
+# --- Сканер ОЗ (как было) ---
 async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("🔍 Ищу матчи...")
-
+    await update.effective_message.reply_text("🔍 Ищу матчи на ОЗ (строгий фильтр)...")
     try:
         leagues_map = await asyncio.to_thread(fetch_leagues_map)
         events = await asyncio.to_thread(fetch_all_events_sync)
         btts_list = await asyncio.to_thread(fetch_data, f"{API_BASE}/odds/", {"market": "btts", "limit": 1000})
-        x12_map = await asyncio.to_thread(fetch_1x2_odds_sync)
-
+        
         btts_map = {}
         for row in btts_list:
             if not isinstance(row, dict): continue
@@ -211,48 +227,97 @@ async def scan_matches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             a_stats = await asyncio.to_thread(get_team_stats_sync, a_id, False)
             if not h_stats or not a_stats: continue
 
-            if (h_stats["btts_pct"] < 50 or a_stats["btts_pct"] < 50 or 
-                h_stats["scored"] < 5 or a_stats["scored"] < 5 or 
-                h_stats["clean"] > 4 or a_stats["clean"] > 4 or
-                h_stats["avg_total"] < 2.1 or a_stats["avg_total"] < 2.1): continue
+            avg_total = (h_stats["avg_total"] + a_stats["avg_total"]) / 2
+            if (h_stats["btts_pct"] < 60 or a_stats["btts_pct"] < 60 or 
+                h_stats["avg_scored"] < 1.1 or a_stats["avg_scored"] < 1.1 or
+                h_stats["avg_conceded"] < 1.0 or a_stats["avg_conceded"] < 1.0 or
+                avg_total < 2.4): continue
 
-            avg = (h_stats["avg_total"] + a_stats["avg_total"]) / 2
-            if avg >= 2.6 and h_stats["btts_pct"] >= 60 and a_stats["btts_pct"] >= 60:
-                signals.append({"id": event.get("id"), "match": match_name, "time": time_str, "league": league_name, "odds": odds, "avg": avg, "date": event.get("event_date")})
+            signals.append({"id": event.get("id"), "match": match_name, "time": time_str, "league": league_name, "odds": odds, "avg": avg_total, "date": event.get("event_date")})
 
         if not signals:
-            await update.effective_message.reply_text("😕 Новых подходящих сигналов на сегодня больше нет.", reply_markup=get_main_keyboard())
+            await update.effective_message.reply_text("😕 Сигналов на ОЗ нет.", reply_markup=get_main_keyboard())
         else:
             signals.sort(key=lambda x: x["avg"], reverse=True)
-            msg = "🟢 <b>Новые сигналы:</b>\n\n"
+            msg = "🟢 <b>Новые сигналы (ОЗ):</b>\n\n"
             for r in signals:
-                msg += f"<b>{r['match']}</b>\n   ⏰ {r['time']} | 🏆 {r['league']}\n   💰 Кэф: {r['odds']:.2f} | Тотал: {r['avg']:.1f}\n\n"
+                msg += f"<b>{r['match']}</b>\n   ⏰ {r['time']} | 🏆 {r['league']}\n   💰 Кэф ОЗ: {r['odds']:.2f} | Тотал: {r['avg']:.1f}\n\n"
             
             sent_msg = await update.effective_message.reply_text(msg, parse_mode="HTML", reply_markup=get_main_keyboard())
             save_message(sent_msg.message_id, msg)
-            
-            for r in signals:
-                save_signal(r["id"], r["match"], r["odds"], r["date"], sent_msg.message_id)
+            for r in signals: save_signal(r["id"], r["match"], r["odds"], r["date"], sent_msg.message_id, "OZ")
 
     except Exception as e:
         await update.effective_message.reply_text(f"❌ Ошибка: {repr(e)}", reply_markup=get_main_keyboard())
 
-# --- Проверка результатов и РЕДАКТИРОВАНИЕ ---
+# --- НОВЫЙ Сканер "Должники" ---
+async def scan_debtors(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text("🧠 Ищу команды-должники (0 голов, но много ударов/xG)...")
+    
+    try:
+        leagues_map = await asyncio.to_thread(fetch_leagues_map)
+        events = await asyncio.to_thread(fetch_all_events_sync)
+        
+        # Берем только предстоящие матчи (ограничим до 20, чтобы не словить бан API)
+        upcoming = [e for e in events if str(e.get("status")).lower() in ["notstarted", "scheduled"]][:20]
+        
+        signals = []
+        for event in upcoming:
+            h_id, a_id = event.get("home_team_id"), event.get("away_team_id")
+            h_name, a_name = event.get("home_team"), event.get("away_team")
+            match_name = f"{h_name} — {a_name}"
+            time_str = extract_time(event)
+            league_name = leagues_map.get(event.get("league_id"), "")
+            
+            if any(kw in league_name.lower() for kw in BLACKLIST_KEYWORDS): continue
+
+            # Проверяем хозяев (должник ли?)
+            h_debtor = await asyncio.to_thread(check_debtor_status_sync, h_id)
+            if h_debtor:
+                # Если хозяева должны забить, смотрим, пропускает ли гость
+                a_stats = await asyncio.to_thread(get_team_stats_sync, a_id, False)
+                if a_stats and a_stats["avg_conceded"] >= 1.0:
+                    signals.append({"match": match_name, "time": time_str, "league": league_name, "team": f"ИТБ 0.5 на {h_name}", "reason": f"В прошлом матче: {h_debtor['sot']} удара в створ, xG {h_debtor['xg']:.1f}. Соперник пропускает {a_stats['avg_conceded']:.1f}", "bet_type": "ITB_HOME"})
+
+            # Проверяем гостей (должник ли?)
+            a_debtor = await asyncio.to_thread(check_debtor_status_sync, a_id)
+            if a_debtor:
+                # Если гости должны забить, смотрим, пропускают ли хозяева
+                h_stats = await asyncio.to_thread(get_team_stats_sync, h_id, True)
+                if h_stats and h_stats["avg_conceded"] >= 1.0:
+                    signals.append({"match": match_name, "time": time_str, "league": league_name, "team": f"ИТБ 0.5 на {a_name}", "reason": f"В прошлом матче: {a_debtor['sot']} удара в створ, xG {a_debtor['xg']:.1f}. Соперник пропускает {h_stats['avg_conceded']:.1f}", "bet_type": "ITB_AWAY"})
+
+        if not signals:
+            await update.effective_message.reply_text("😕 Команд-должников с подходящими соперниками не найдено.", reply_markup=get_main_keyboard())
+        else:
+            msg = "🧠 <b>Найдены команды-должники (Рекомендация ИТБ 0.5):</b>\n\n"
+            for r in signals:
+                msg += f"<b>{r['match']}</b>\n   ⏰ {r['time']} | 🏆 {r['league']}\n   🎯 {r['team']}\n   📊 {r['reason']}\n\n"
+            
+            sent_msg = await update.effective_message.reply_text(msg, parse_mode="HTML", reply_markup=get_main_keyboard())
+            save_message(sent_msg.message_id, msg)
+            for r in signals: save_signal(0, r["match"], 1.0, datetime.now().isoformat(), sent_msg.message_id, r["bet_type"])
+
+    except Exception as e:
+        await update.effective_message.reply_text(f"❌ Ошибка: {repr(e)}", reply_markup=get_main_keyboard())
+
+# --- Обновление результатов (с учетом типа ставки) ---
 async def update_results(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT event_id, match_name, message_id FROM signals WHERE status='pending'")
+    c.execute("SELECT event_id, match_name, message_id, bet_type FROM signals WHERE status='pending'")
     pending = c.fetchall()
     conn.close()
 
-    if not pending:
-        return # Молчим, если нет ожидающих матчей
+    if not pending: return
 
     updates_by_msg = {}
     updated_count = 0
 
-    for event_id, match_name, msg_id in pending:
-        if not msg_id: continue
+    # Для "Должников" event_id = 0, мы сохранили только название. Придется искать по названию в API (это сложнее) 
+    # Или просто помечать их как "ручное отслеживание". Для простоты в этой версии обновляем только ОЗ (event_id > 0)
+    for event_id, match_name, msg_id, bet_type in pending:
+        if event_id == 0 or not msg_id: continue 
         
         data = await asyncio.to_thread(fetch_data, f"{API_BASE}/events/{event_id}/")
         if isinstance(data, dict) and "error" not in data:
@@ -267,38 +332,36 @@ async def update_results(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 icon = "✅ ЗАШЛА" if res == "win" else "❌ НЕ ЗАШЛА"
                 result_str = f"{icon} ({hg}:{ag})"
                 
-                if msg_id not in updates_by_msg:
-                    updates_by_msg[msg_id] = {}
+                if msg_id not in updates_by_msg: updates_by_msg[msg_id] = {}
                 updates_by_msg[msg_id][match_name] = result_str
 
     edited_any = False
     for msg_id, results in updates_by_msg.items():
         old_text = get_message_text(msg_id)
         if not old_text: continue
-
         new_text = old_text
         for match_name, result_str in results.items():
             search_str = f"<b>{match_name}</b>"
             if result_str not in old_text:
-                replace_str = f"<b>{match_name}</b> — {result_str}"
-                new_text = new_text.replace(search_str, replace_str)
+                new_text = new_text.replace(search_str, f"<b>{match_name}</b> — {result_str}")
             
         if new_text != old_text:
             try:
                 await ctx.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=msg_id, text=new_text, parse_mode="HTML", reply_markup=get_main_keyboard())
                 save_message(msg_id, new_text)
                 edited_any = True
-            except Exception as e:
-                logger.error(f"Не удалось отредактировать сообщение {msg_id}: {e}")
+            except Exception: pass
 
     if edited_any:
-        await update.effective_message.reply_text(f"✅ Результаты обновлены (завершилось: {updated_count}).", reply_markup=get_main_keyboard())
+        await update.effective_message.reply_text(f"✅ Результаты ОЗ обновлены (завершилось: {updated_count}).", reply_markup=get_main_keyboard())
+    else:
+        await update.effective_message.reply_text("Матчи еще не завершились.", reply_markup=get_main_keyboard())
 
-# --- Экспорт в CSV ---
+# --- Экспорт ---
 async def export_data(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT event_id, match_name, odds, event_date, status, result FROM signals")
+    c.execute("SELECT event_id, match_name, odds, event_date, status, result, bet_type FROM signals")
     rows = c.fetchall()
     conn.close()
 
@@ -309,41 +372,27 @@ async def export_data(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     filename = "btts_history.csv"
     with open(filename, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["ID", "Матч", "Кэф ОЗ", "Дата", "Статус", "Результат"])
+        writer.writerow(["ID", "Матч", "Кэф ОЗ", "Дата", "Статус", "Результат", "Тип ставки"])
         writer.writerows(rows)
 
     with open(filename, "rb") as f:
-        await update.effective_message.reply_document(document=f, filename=filename, caption="📊 История сигналов.", reply_markup=get_main_keyboard())
-    
+        await update.effective_message.reply_document(document=f, filename=filename, caption="📊 История.", reply_markup=get_main_keyboard())
     os.remove(filename)
 
-# --- Обработчик нажатий на кнопки ---
 async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer() # Убираем "часики" на кнопке
-
-    if query.data == "cmd_scan":
-        await scan_matches(update, ctx)
-    elif query.data == "cmd_update":
-        await update_results(update, ctx)
-    elif query.data == "cmd_export":
-        await export_data(update, ctx)
+    await query.answer()
+    if query.data == "cmd_scan": await scan_matches(update, ctx)
+    elif query.data == "cmd_debtors": await scan_debtors(update, ctx)
+    elif query.data == "cmd_update": await update_results(update, ctx)
+    elif query.data == "cmd_export": await export_data(update, ctx)
 
 def main():
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
-    
-    # Команды (на случай если вы захотите вводить их вручную)
     app.add_handler(CommandHandler("start", start_menu))
-    app.add_handler(CommandHandler("menu", start_menu))
-    app.add_handler(CommandHandler("scan", scan_matches))
-    app.add_handler(CommandHandler("update", update_results))
-    app.add_handler(CommandHandler("export", export_data))
-    
-    # Обработчик кнопок
     app.add_handler(CallbackQueryHandler(button_handler))
-    
-    logger.info("Bot started (Buttons Mode)")
+    logger.info("Bot started (Debtor + OZ Mode)")
     app.run_polling()
 
 if __name__ == "__main__":
