@@ -31,20 +31,17 @@ BLACKLIST_KEYWORDS = [
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    # Основная таблица сигналов
     c.execute('''CREATE TABLE IF NOT EXISTS signals
                  (event_id INTEGER PRIMARY KEY, match_name TEXT, odds REAL, 
                   event_date TEXT, status TEXT, result TEXT, message_id INTEGER, bet_type TEXT DEFAULT 'OZ')''')
-    # Таблица сообщений
     c.execute('''CREATE TABLE IF NOT EXISTS messages
                  (message_id INTEGER PRIMARY KEY, text TEXT)''')
-    # ТАБЛИЦА КЭША СТАТИСТИКИ
+    # Таблицы кэша
     c.execute('''CREATE TABLE IF NOT EXISTS team_stats_cache
                  (team_id INTEGER, is_home INTEGER, date TEXT, 
                   btts_pct REAL, scored_count INTEGER, clean_count INTEGER, 
                   avg_scored REAL, avg_conceded REAL, avg_total REAL, n INTEGER,
                   PRIMARY KEY (team_id, is_home, date))''')
-    # ТАБЛИЦА КЭША ДОЛЖНИКОВ
     c.execute('''CREATE TABLE IF NOT EXISTS debtor_cache
                  (team_id INTEGER, date TEXT, is_debtor INTEGER, sot INTEGER, xg REAL,
                   PRIMARY KEY (team_id, date))''')
@@ -125,7 +122,6 @@ def get_team_stats_sync(team_id, is_home):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     
-    # 1. Проверяем кэш на сегодня
     c.execute("SELECT btts_pct, scored_count, clean_count, avg_scored, avg_conceded, avg_total, n FROM team_stats_cache WHERE team_id=? AND is_home=? AND date=?", 
               (team_id, int(is_home), today))
     cached = c.fetchone()
@@ -135,10 +131,8 @@ def get_team_stats_sync(team_id, is_home):
             "btts_pct": cached[0], "scored_count": cached[1], "clean_count": cached[2], 
             "avg_scored": cached[3], "avg_conceded": cached[4], "avg_total": cached[5], "n": cached[6]
         }
-    
-    conn.close() # Закрываем перед запросом
+    conn.close()
 
-    # 2. Если нет в кэше — идем в API
     data = fetch_data(f"{API_BASE}/events/", {"team_id": team_id, "limit": 30})
     if isinstance(data, dict) and "error" in data: return None
     matches = data if isinstance(data, list) else []
@@ -165,7 +159,6 @@ def get_team_stats_sync(team_id, is_home):
         "avg_scored": goals_scored/n, "avg_conceded": goals_conceded/n, "avg_total": (goals_scored+goals_conceded)/n, "n": n
     }
 
-    # 3. Сохраняем в кэш
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("INSERT OR REPLACE INTO team_stats_cache VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -181,7 +174,6 @@ def check_debtor_status_sync(team_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     
-    # 1. Проверяем кэш на сегодня
     c.execute("SELECT is_debtor, sot, xg FROM debtor_cache WHERE team_id=? AND date=?", (team_id, today))
     cached = c.fetchone()
     if cached:
@@ -189,10 +181,8 @@ def check_debtor_status_sync(team_id):
         if cached[0] == 1:
             return {"sot": cached[1], "xg": cached[2]}
         return False
-        
     conn.close()
 
-    # 2. Если нет в кэше — идем в API
     data = fetch_data(f"{API_BASE}/events/", {"team_id": team_id, "limit": 10})
     if isinstance(data, dict) and "error" in data: return False
     matches = data if isinstance(data, list) else []
@@ -207,7 +197,6 @@ def check_debtor_status_sync(team_id):
     goals_scored = hg if last_match.get("home_team_id") == team_id else ag
     
     if goals_scored > 0: 
-        # Сохраняем в кэш, что не должник
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute("INSERT OR REPLACE INTO debtor_cache VALUES (?, ?, ?, ?, ?)", (team_id, today, 0, 0, 0.0))
@@ -215,7 +204,6 @@ def check_debtor_status_sync(team_id):
         conn.close()
         return False 
 
-    # Идем в статистику матча
     stats_data = fetch_data(f"{API_BASE}/events/{match_id}/stats/")
     if isinstance(stats_data, dict) and "error" not in stats_data:
         xg = stats_data.get("expectedGoalsHome") if last_match.get("home_team_id") == team_id else stats_data.get("expectedGoalsAway")
@@ -226,7 +214,6 @@ def check_debtor_status_sync(team_id):
         
         is_debtor = 1 if (xg >= 1.2 or sot >= 4) else 0
         
-        # 3. Сохраняем в кэш
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute("INSERT OR REPLACE INTO debtor_cache VALUES (?, ?, ?, ?, ?)", (team_id, today, is_debtor, sot, xg))
@@ -250,9 +237,9 @@ def get_main_keyboard():
 async def start_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("⚽ <b>Главное меню:</b>", reply_markup=get_main_keyboard(), parse_mode="HTML")
 
-# --- Сканер (без жестких лимитов, т.к. работает кэш) ---
+# --- Сканер (с отчетом и лимитом 40) ---
 async def scan_all_markets(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("🔍 Сканирую матчи (с кэшированием статистики)...")
+    await update.effective_message.reply_text("🔍 Сканирую (с подробным отчетом, лимит 40 матчей)...")
     
     try:
         leagues_map = await asyncio.to_thread(fetch_leagues_map)
@@ -272,32 +259,42 @@ async def scan_all_markets(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     if eid not in btts_map or price > btts_map[eid]: btts_map[eid] = price
                 except: pass
 
+        total_events = len([e for e in events if str(e.get("status")).lower() in ["notstarted", "scheduled"]])
+        drop_league = 0
+        drop_no_odds = 0
+        
         candidates = []
         for event in events:
             if not isinstance(event, dict): continue
             if str(event.get("status")).lower() not in ["notstarted", "scheduled"]: continue
             eid = event.get("id")
             league_name = leagues_map.get(event.get("league_id"), "")
-            if any(kw in league_name.lower() for kw in BLACKLIST_KEYWORDS): continue
-            candidates.append((event, league_name))
+            
+            if any(kw in league_name.lower() for kw in BLACKLIST_KEYWORDS): 
+                drop_league += 1
+                continue
+                
+            if eid not in btts_map:
+                drop_no_odds += 1
+                continue
+                
+            candidates.append((event, league_name, btts_map[eid]))
 
         oz_signals = []
         itb_signals = []
         tb_signals = []
         
-        total_checked = len(candidates)
         no_history = 0
+        analyzed = 0
 
-        # Увеличили лимит до 20 матчей, так как кэш экономит запросы
-        for idx, (event, league_name) in enumerate(candidates[:20]):
+        for idx, (event, league_name, oz_odds) in enumerate(candidates[:40]):
             h_id, a_id = event.get("home_team_id"), event.get("away_team_id")
             h_name, a_name = event.get("home_team"), event.get("away_team")
             match_name = f"{h_name} — {a_name}"
             time_str = extract_time(event)
             eid = event.get("id")
             
-            # Небольшая пауза только для новых запросов
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.3)
 
             h_stats = await asyncio.to_thread(get_team_stats_sync, h_id, True)
             a_stats = await asyncio.to_thread(get_team_stats_sync, a_id, False)
@@ -306,8 +303,8 @@ async def scan_all_markets(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 no_history += 1
                 continue
 
+            analyzed += 1
             avg_total = (h_stats["avg_total"] + a_stats["avg_total"]) / 2
-            oz_odds = btts_map.get(eid, 0)
 
             # --- 1. РЫНОК ОЗ ---
             if (h_stats["btts_pct"] >= 55 and a_stats["btts_pct"] >= 55 and 
@@ -317,8 +314,8 @@ async def scan_all_markets(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 
                 oz_signals.append({"id": eid, "match": match_name, "time": time_str, "league": league_name, "odds": oz_odds, "date": event.get("event_date"), "bet_type": "OZ", "text": f"💰 Кэф ОЗ: {oz_odds:.2f} | Тотал: {avg_total:.1f}"})
 
-            # --- 2. РЫНОК ТБ 1.5 ---
-            if avg_total >= 2.5 and h_stats["avg_scored"] >= 1.0 and a_stats["avg_scored"] >= 1.0:
+            # --- 2. РЫНОК ТБ 1.5 (порог 2.2) ---
+            if avg_total >= 2.2 and h_stats["avg_scored"] >= 1.0 and a_stats["avg_scored"] >= 1.0:
                 tb_signals.append({"id": eid, "match": match_name, "time": time_str, "league": league_name, "date": event.get("event_date"), "bet_type": "TB1.5", "text": f"Средний тотал: {avg_total:.1f}"})
 
             # --- 3. РЫНОК ИТБ 0.5 ---
@@ -330,10 +327,17 @@ async def scan_all_markets(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if a_debtor and h_stats["avg_conceded"] >= 1.0:
                 itb_signals.append({"id": eid, "match": match_name, "time": time_str, "league": league_name, "date": event.get("event_date"), "bet_type": "ITB", "text": f"ИТБ 0.5 на {a_name} (xG {a_debtor['xg']:.1f}, {a_debtor['sot']} удара)"})
 
-        footer = f"\n📊 <i>Проверено матчей: {total_checked}. Проанализировано: до 20. Без истории: {no_history}.</i>"
+        footer = (
+            f"\n📊 <b>Отчет об отсеве:</b>\n"
+            f"• Всего предстоящих: {total_events}\n"
+            f"• Отсеяно по лигам (кубки/молодежки): {drop_league}\n"
+            f"• Без кэфов на ОЗ в API: {drop_no_odds}\n"
+            f"• Проанализировано: {analyzed}\n"
+            f"• Без истории матчей: {no_history}"
+        )
 
         if not oz_signals and not itb_signals and not tb_signals:
-            await update.effective_message.reply_text(f"😕 Сегодня нет подходящих матчей.{footer}", reply_markup=get_main_keyboard(), parse_mode="HTML")
+            await update.effective_message.reply_text(f"😕 Подходящих матчей не найдено.{footer}", reply_markup=get_main_keyboard(), parse_mode="HTML")
             return
 
         msg = "📋 <b>Результаты сканирования:</b>\n"
@@ -465,7 +469,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_menu))
     app.add_handler(CallbackQueryHandler(button_handler))
-    logger.info("Bot started (Caching Mode)")
+    logger.info("Bot started (Full Caching + Limits 40)")
     app.run_polling()
 
 if __name__ == "__main__":
